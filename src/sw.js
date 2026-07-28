@@ -152,7 +152,7 @@ async function addHostHeaderRule(server, host, port) {
       removeRuleIds: [2],
       addRules: [{
         id: 2, priority: 1,
-        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: host + ':' + port }] },
+        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: host }] },
         condition: { urlFilter: `||${server}` }
       }]
     });
