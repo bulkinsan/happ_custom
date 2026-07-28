@@ -1,8 +1,8 @@
 {
   "name": "happ-vpn-proxy",
   "description": "Happ VPN local proxy",
-  "path": "node",
-  "args": ["proxy.js"],
+  "path": "C:\\Program Files\\nodejs\\node.exe",
+  "args": ["F:\\yandexdisk\\dev\\project\\happ_by_texturaz\\happ_castom_v1\\native-host\\proxy.js"],
   "type": "stdio",
-  "allowed_origins": []
+  "allowed_origins": ["chrome-extension://fncmcjbigeohldblbfhignhljgppohee/"]
 }

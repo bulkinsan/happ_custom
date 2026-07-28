@@ -3,6 +3,8 @@ const net = require('net');
 const { URL } = require('url');
 const crypto = require('crypto');
 
+function log(...args) { process.stderr.write(args.join(' ') + '\n'); }
+
 let config = null;
 let proxyServer = null;
 const PORT = 18080;
@@ -78,7 +80,7 @@ function handleConnect(req, clientSocket, head) {
     clientSocket.on('error', () => { try { ws.close(); } catch {} });
     ws.on('error', () => { if (!clientSocket.destroyed) clientSocket.destroy(); });
   }).catch((err) => {
-    console.error('VLESS connect failed:', err.message);
+    log('VLESS connect failed:', err.message);
     clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
     clientSocket.end();
   });
@@ -89,7 +91,7 @@ function startProxy() {
     proxyServer = http.createServer(handleConnect);
     proxyServer.on('error', reject);
     proxyServer.listen(PORT, '127.0.0.1', () => {
-      console.log(`Proxy listening on 127.0.0.1:${PORT}`);
+      log('Proxy listening on 127.0.0.1:' + PORT);
       resolve(PORT);
     });
   });
@@ -107,27 +109,26 @@ function stopProxy() {
 
 function readMessage(stream) {
   return new Promise((resolve, reject) => {
-    const lenBuf = Buffer.alloc(4);
-    let read = 0;
-    const onLength = (chunk) => {
-      lenBuf.writeUInt32LE(chunk.readUInt32LE(0), 0);
-      const msgLen = lenBuf.readUInt32LE(0);
-      if (msgLen === 0) return resolve(null);
-      stream.removeListener('data', onLength);
-      const msgBuf = Buffer.alloc(msgLen);
-      let msgRead = 0;
-      const onMsg = (chunk) => {
-        chunk.copy(msgBuf, msgRead);
-        msgRead += chunk.length;
-        if (msgRead >= msgLen) {
-          stream.removeListener('data', onMsg);
-          resolve(JSON.parse(msgBuf.toString('utf8')));
+    let buf = Buffer.alloc(0);
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      while (buf.length >= 4) {
+        const msgLen = buf.readUInt32LE(0);
+        if (buf.length < 4 + msgLen) break;
+        stream.removeListener('data', onData);
+        const json = buf.slice(4, 4 + msgLen).toString('utf8');
+        buf = Buffer.alloc(0);
+        try {
+          resolve(JSON.parse(json));
+        } catch (e) {
+          reject(new Error('JSON parse error: ' + e.message));
         }
-      };
-      stream.on('data', onMsg);
+        return;
+      }
     };
-    stream.on('data', onLength);
+    stream.on('data', onData);
     stream.on('error', reject);
+    stream.on('end', () => resolve(null));
   });
 }
 
@@ -173,6 +174,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error('Fatal:', err);
+  log('Fatal:', err);
   process.exit(1);
 });

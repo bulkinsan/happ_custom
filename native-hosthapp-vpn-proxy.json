@@ -1,0 +1,8 @@
+{
+  "name": "happ-vpn-proxy",
+  "description": "Happ VPN local proxy",
+  "path": "!NODE_PATH!",
+  "args": ["F:\yandexdisk\dev\project\happ_by_texturaz\happ_castom_v1\native-hostproxy.js"],
+  "type": "stdio",
+  "allowed_origins": []
+}
