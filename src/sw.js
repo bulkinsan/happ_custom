@@ -171,14 +171,14 @@ async function clearDynamicRules() {
 let proxyTabId = null;
 
 async function pingServer(config) {
-  const proto = config.security === 'tls' ? 'wss' : 'ws';
-  const url = `${proto}://${config.server}:${config.port}${config.path}`;
-  const start = Date.now();
   try {
+    const proto = config.security === 'tls' ? 'wss' : 'ws';
+    const url = `${proto}://${config.server}:${config.port}${config.path}`;
+    const start = Date.now();
     const ws = new WebSocket(url);
     await new Promise((resolve, reject) => {
       ws.onopen = () => { ws.close(); resolve(); };
-      ws.onerror = (e) => { reject(new Error('WS error')); };
+      ws.onerror = () => reject(new Error('WS error'));
       setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 5000);
     });
     return Date.now() - start;
@@ -328,10 +328,13 @@ async function connectToServer(serverName) {
   console.log('connectToServer called with:', serverName);
   let config;
   if (!serverName || serverName === 'auto') {
-    const pings = await Promise.allSettled(serverList.map(async s => ({ s, ping: await pingServer(s) })));
-    const valid = pings.filter(r => r.status === 'fulfilled' && r.value.ping > 0).sort((a, b) => a.value.ping - b.value.ping);
-    if (valid.length === 0) throw new Error('No reachable servers');
-    config = valid[0].value.s;
+    let best = null;
+    for (const s of serverList) {
+      const ping = await pingServer(s);
+      if (ping > 0 && (!best || ping < best.ping)) best = { s, ping };
+    }
+    if (!best) throw new Error('No reachable servers');
+    config = best.s;
   } else {
     config = serverList.find(s => s.name === serverName);
     if (!config) throw new Error('Server not found');
@@ -480,6 +483,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         for (const s of serverList) {
           const p = await pingServer(s);
           results.push({ name: s.name, ping: p });
+          if (serverList.length > 5) await new Promise(r => setTimeout(r, 100));
         }
         sendResponse({ results });
       })();
