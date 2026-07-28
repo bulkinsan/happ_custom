@@ -370,23 +370,27 @@ async function connectToServer(serverName) {
 
   await addHostHeaderRule(config.server, config.host);
 
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  for (const tab of tabs) {
-    if (tab.url && !tab.url.startsWith('chrome://') && !tab.url.startsWith('chrome-extension://')) {
-      try {
-        proxyTabId = tab.id;
-        await chrome.debugger.attach({ tabId: tab.id }, '1.3');
-        await chrome.debugger.sendCommand({ tabId: tab.id }, 'Fetch.enable', {
-          patterns: [{ urlPattern: '*', requestStage: 'request' }]
-        });
-        await injectWsProxy(tab.id);
-        console.log('Debugger attached and WS proxy injected to tab', tab.id);
-      } catch (e) {
-        console.error('Failed to setup debugger/proxy on tab', tab.id, tab.url, e);
-      }
-    } else {
-      console.warn('Skipping tab, unsupported URL:', tab?.url);
+  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  let tab = tabs?.[0];
+  if (!tab || !tab.url || tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
+    console.warn('Active tab not suitable, trying any non-restricted tab.');
+    const all = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] });
+    tab = all?.[0];
+  }
+  if (tab && tab.id && tab.url && !tab.url.startsWith('chrome://') && !tab.url.startsWith('chrome-extension://')) {
+    try {
+      proxyTabId = tab.id;
+      await chrome.debugger.attach({ tabId: tab.id }, '1.3');
+      await chrome.debugger.sendCommand({ tabId: tab.id }, 'Fetch.enable', {
+        patterns: [{ urlPattern: '*', requestStage: 'request' }]
+      });
+      await injectWsProxy(tab.id);
+      console.log('Debugger attached and WS proxy injected to tab', tab.id, tab.url);
+    } catch (e) {
+      console.error('Failed to setup debugger/proxy on tab', tab.id, tab.url, e);
     }
+  } else {
+    console.error('No suitable tab found for proxy. Open a regular web page (http/https) and try again.');
   }
 
   chrome.tabs.onActivated.addListener(onTabActivated);
