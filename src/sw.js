@@ -192,15 +192,13 @@ async function disableProxy() {
 
 async function pingServer(config) {
   try {
-    const proto = config.security === 'tls' ? 'wss' : 'ws';
+    const proto = config.security === 'tls' ? 'https' : 'http';
     const url = `${proto}://${config.server}:${config.port}${config.path}`;
     const start = Date.now();
-    const ws = new WebSocket(url);
-    await new Promise((resolve, reject) => {
-      ws.onopen = () => { ws.close(); resolve(); };
-      ws.onerror = () => reject(new Error('WS error'));
-      setTimeout(() => { try { ws.close(); } catch {} reject(new Error('timeout')); }, 5000);
-    });
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 5000);
+    await fetch(url, { mode: 'no-cors', signal: controller.signal });
+    clearTimeout(t);
     return Date.now() - start;
   } catch {
     return -1;

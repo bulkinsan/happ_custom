@@ -142,7 +142,14 @@ function sendMessage(stream, obj) {
 }
 
 async function main() {
+  log('Native host started, waiting for message...');
   const msg = await readMessage(process.stdin);
+  log('Received message:', JSON.stringify(msg));
+
+  if (!msg || !msg.action) {
+    log('Invalid or empty message, exiting');
+    process.exit(1);
+  }
 
   if (msg.action === 'start') {
     config = msg.config;
