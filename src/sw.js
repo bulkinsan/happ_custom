@@ -172,6 +172,7 @@ function injectWsProxy(tabId) {
           else sendResponse({ ok: false });
         }
       });
+      console.log('WS proxy content script loaded');
     }
   }).catch(e => console.error('Inject WS proxy failed:', e));
 }
@@ -377,7 +378,8 @@ async function connectToServer(serverName) {
         await chrome.debugger.sendCommand({ tabId: tab.id }, 'Fetch.enable', {
           patterns: [{ urlPattern: '*', requestStage: 'request' }]
         });
-        injectWsProxy(tab.id);
+        await injectWsProxy(tab.id);
+        console.log('Debugger attached and WS proxy injected to tab', tab.id);
       } catch {}
     }
   }
@@ -420,7 +422,7 @@ async function onTabActivated(info) {
     await chrome.debugger.sendCommand({ tabId: info.tabId }, 'Fetch.enable', {
       patterns: [{ urlPattern: '*', requestStage: 'request' }]
     });
-    injectWsProxy(info.tabId);
+    await injectWsProxy(info.tabId);
   } catch {}
 }
 
@@ -434,7 +436,7 @@ async function onTabCreated(tab) {
         await chrome.debugger.sendCommand({ tabId }, 'Fetch.enable', {
           patterns: [{ urlPattern: '*', requestStage: 'request' }]
         });
-        injectWsProxy(tabId);
+        await injectWsProxy(tabId);
       } catch {}
       chrome.tabs.onUpdated.removeListener(listener);
     }
@@ -462,11 +464,18 @@ async function onDebuggerEvent(source, method, params) {
   try {
     if (url.startsWith('ws://') || url.startsWith('wss://')) {
       const parsed = new URL(url);
+      console.log('WS request intercepted:', url);
       if (activeConfig && parsed.hostname === activeConfig.server) {
         const reqHeaders = [];
         for (const [name, value] of Object.entries(request.headers || {})) {
-          reqHeaders.push({ name, value: name.toLowerCase() === 'host' ? activeConfig.host : value });
+          if (name.toLowerCase() === 'host') {
+            const port = parsed.port ? ':' + parsed.port : '';
+            reqHeaders.push({ name, value: activeConfig.host + port });
+          } else {
+            reqHeaders.push({ name, value });
+          }
         }
+        console.log('Modifying Host header for WS request');
         await chrome.debugger.sendCommand(
           { tabId: source.tabId, sessionId: source.sessionId },
           'Fetch.continueRequest',
