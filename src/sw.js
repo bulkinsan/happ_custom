@@ -157,6 +157,7 @@ async function addHostHeaderRule(server, host, port) {
       }]
     });
   } catch (e) { console.error('DNR add rule failed:', e); }
+  console.log('DNR rule set: Host ->', host);
 }
 
 async function clearDynamicRules() {
@@ -190,6 +191,7 @@ async function ensureWsProxy() {
     if (!e.message.includes('already exists')) throw e;
   }
   await ready;
+  console.log('Offscreen WS proxy ready');
 }
 
 async function closeWsProxy() {
@@ -215,6 +217,7 @@ async function pingServer(config) {
 }
 
 async function proxyHttpRequest(config, method, host, port, path, headers, body) {
+  console.log('proxyHttpRequest:', method, host);
   if (!wsPort) throw new Error('No WS proxy available');
   const proto = config.security === 'tls' ? 'wss' : 'ws';
   const url = `${proto}://${config.server}:${config.port}${config.path}`;
