@@ -193,11 +193,18 @@ async function disableProxy() {
 async function pingServer(config) {
   try {
     const start = Date.now();
-    const resp = await fetch(`http://127.0.0.1:${proxyPort}/ping`, {
-      method: 'HEAD',
-      signal: AbortSignal.timeout(5000)
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const resp = await fetch(`http://${config.host}:${config.port}${config.path}`, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: { 'Host': config.host + ':' + config.port }
     }).catch(() => null);
-    if (resp) return Date.now() - start;
+    clearTimeout(timeout);
+    if (resp) {
+      resp.body?.cancel();
+      return Date.now() - start;
+    }
     return -1;
   } catch {
     return -1;
@@ -283,7 +290,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       (async () => {
         const results = [];
         for (const s of serverList) {
-          results.push({ name: s.name, ping: -1 });
+          const p = await pingServer(s);
+          results.push({ name: s.name, ping: p });
+          if (serverList.length > 5) await new Promise(r => setTimeout(r, 100));
         }
         sendResponse({ results });
       })();
