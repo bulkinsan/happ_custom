@@ -109,13 +109,13 @@ async function loadServers() {
   return serverList;
 }
 
-async function addHostHeaderRule(server, host) {
+async function addHostHeaderRule(server, host, port) {
   try {
     await chrome.declarativeNetRequest.updateDynamicRules({
       removeRuleIds: [2],
       addRules: [{
         id: 2, priority: 1,
-        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: host }] },
+        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: host + ':' + port }] },
         condition: { urlFilter: `||${server}`, resourceTypes: ['websocket'] }
       }]
     });
@@ -368,7 +368,7 @@ async function connectToServer(serverName) {
   await saveStats(stats);
   await chrome.storage.local.set({ connected: true, activeServer: config });
 
-  await addHostHeaderRule(config.server, config.host);
+  await addHostHeaderRule(config.server, config.host, config.port);
 
   const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   let tab = tabs?.[0];
@@ -382,19 +382,19 @@ async function connectToServer(serverName) {
       proxyTabId = tab.id;
       await chrome.debugger.attach({ tabId: tab.id }, '1.3');
       await chrome.debugger.sendCommand({ tabId: tab.id }, 'Fetch.enable', {
-        patterns: [{ urlPattern: '*', requestStage: 'request' }]
+        patterns: [
+          { urlPattern: 'http://*/*', requestStage: 'request' }
+        ]
       });
       await injectWsProxy(tab.id);
-      console.log('Debugger attached and WS proxy injected to tab', tab.id, tab.url);
+      console.log('Debugger + WS proxy ready on tab', tab.id, tab.url);
     } catch (e) {
-      console.error('Failed to setup debugger/proxy on tab', tab.id, tab.url, e);
+      console.error('Setup failed:', e);
     }
   } else {
-    console.error('No suitable tab found for proxy. Open a regular web page (http/https) and try again.');
+    console.error('No suitable tab for proxy. Open a regular web page and try again.');
   }
 
-  chrome.tabs.onActivated.addListener(onTabActivated);
-  chrome.tabs.onCreated.addListener(onTabCreated);
   chrome.debugger.onEvent.addListener(onDebuggerEvent);
   chrome.debugger.onDetach.addListener(onDebuggerDetach);
 
@@ -402,16 +402,13 @@ async function connectToServer(serverName) {
 }
 
 async function disconnect() {
-  proxyTabId = null;
   await removeHostHeaderRule();
-  chrome.tabs.onActivated.removeListener(onTabActivated);
-  chrome.tabs.onCreated.removeListener(onTabCreated);
   chrome.debugger.onEvent.removeListener(onDebuggerEvent);
   chrome.debugger.onDetach.removeListener(onDebuggerDetach);
 
-  const tabs = await chrome.tabs.query({});
-  for (const tab of tabs) {
-    try { await chrome.debugger.detach({ tabId: tab.id }); } catch {}
+  if (proxyTabId) {
+    try { await chrome.debugger.detach({ tabId: proxyTabId }); } catch {}
+    proxyTabId = null;
   }
 
   activeConfig = null;
@@ -423,46 +420,23 @@ async function disconnect() {
   await chrome.storage.local.set({ connected: false, activeServer: null });
 }
 
-async function onTabActivated(info) {
-  if (!isConnected) return;
-  try {
-    proxyTabId = info.tabId;
-    await chrome.debugger.attach({ tabId: info.tabId }, '1.3');
-    await chrome.debugger.sendCommand({ tabId: info.tabId }, 'Fetch.enable', {
-      patterns: [{ urlPattern: '*', requestStage: 'request' }]
-    });
-    await injectWsProxy(info.tabId);
-  } catch {}
-}
-
-async function onTabCreated(tab) {
-  if (!isConnected) return;
-  const listener = async (tabId, info) => {
-    if (tabId === tab.id && info.status === 'loading') {
-      try {
-        proxyTabId = tabId;
-        await chrome.debugger.attach({ tabId }, '1.3');
-        await chrome.debugger.sendCommand({ tabId }, 'Fetch.enable', {
-          patterns: [{ urlPattern: '*', requestStage: 'request' }]
-        });
-        await injectWsProxy(tabId);
-      } catch {}
-      chrome.tabs.onUpdated.removeListener(listener);
-    }
-  };
-  chrome.tabs.onUpdated.addListener(listener);
-}
-
 function onDebuggerDetach(source) {
   if (!isConnected || !source.tabId) return;
+  console.warn('Debugger detached from tab', source.tabId);
   setTimeout(async () => {
     try {
       await chrome.debugger.attach({ tabId: source.tabId }, '1.3');
       await chrome.debugger.sendCommand({ tabId: source.tabId }, 'Fetch.enable', {
-        patterns: [{ urlPattern: '*', requestStage: 'request' }]
+        patterns: [
+          { urlPattern: 'http://*/*', requestStage: 'request' }
+        ]
       });
-    } catch {}
-  }, 500);
+      await injectWsProxy(source.tabId);
+      console.log('Debugger re-attached to tab', source.tabId);
+    } catch (e) {
+      console.error('Re-attach failed:', e);
+    }
+  }, 1000);
 }
 
 async function onDebuggerEvent(source, method, params) {
@@ -471,35 +445,6 @@ async function onDebuggerEvent(source, method, params) {
   const url = request.url;
 
   try {
-    if (url.startsWith('ws://') || url.startsWith('wss://')) {
-      const parsed = new URL(url);
-      console.log('WS request intercepted:', url);
-      if (activeConfig && parsed.hostname === activeConfig.server) {
-        const reqHeaders = [];
-        for (const [name, value] of Object.entries(request.headers || {})) {
-          if (name.toLowerCase() === 'host') {
-            const port = parsed.port ? ':' + parsed.port : '';
-            reqHeaders.push({ name, value: activeConfig.host + port });
-          } else {
-            reqHeaders.push({ name, value });
-          }
-        }
-        console.log('Modifying Host header for WS request');
-        await chrome.debugger.sendCommand(
-          { tabId: source.tabId, sessionId: source.sessionId },
-          'Fetch.continueRequest',
-          { requestId, headers: reqHeaders }
-        );
-      } else {
-        await chrome.debugger.sendCommand(
-          { tabId: source.tabId, sessionId: source.sessionId },
-          'Fetch.continueRequest',
-          { requestId }
-        );
-      }
-      return;
-    }
-
     if (url.startsWith('http://') && activeConfig) {
       const parsed = new URL(url);
       const hdrs = Array.isArray(request.headers) ? request.headers.map(h => [h.name, h.value]) : Object.entries(request.headers || {});
@@ -526,7 +471,8 @@ async function onDebuggerEvent(source, method, params) {
         { requestId }
       );
     }
-  } catch {
+  } catch (e) {
+    console.error('onDebuggerEvent error:', e);
     try {
       await chrome.debugger.sendCommand(
         { tabId: source.tabId, sessionId: source.sessionId },
