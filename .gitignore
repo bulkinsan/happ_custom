@@ -1,0 +1,14 @@
+# Secrets and keys
+*.key
+*.pem
+*.cert
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

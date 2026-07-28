@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div id="app">
+    <header>
+      <div class="logo">Happ VPN</div>
+    </header>
+
+    <div id="setup-panel" class="hidden">
+      <div class="setup-content">
+        <div class="setup-icon">🔑</div>
+        <div class="setup-title">Subscription Required</div>
+        <div class="setup-desc">Enter your VPN subscription URL in settings to get started.</div>
+        <button id="goto-settings-btn" class="setup-btn">Open Settings</button>
+      </div>
+    </div>
+
+    <div id="main-panel">
+      <div id="connection-panel">
+        <button id="connect-btn" class="connect-btn">
+          <div class="power-icon"></div>
+          <span id="connect-label">Connect</span>
+        </button>
+        <div id="status-text">Disconnected</div>
+        <div id="server-name" class="hidden"></div>
+      </div>
+
+      <div id="stats-panel" class="hidden">
+        <div class="stat">
+          <span class="stat-label">Download</span>
+          <span id="rx-value" class="stat-value">0 B</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Upload</span>
+          <span id="tx-value" class="stat-value">0 B</span>
+        </div>
+        <div class="stat">
+          <span class="stat-label">Session</span>
+          <span id="duration-value" class="stat-value">0s</span>
+        </div>
+      </div>
+
+      <div id="server-panel">
+        <div class="panel-header">
+          <span>Servers</span>
+          <div class="panel-actions">
+            <button id="ping-all-btn" class="ping-all-btn" title="Ping all servers">Ping</button>
+            <button id="refresh-config-btn" class="ping-all-btn" title="Reload config from server">Refresh</button>
+            <span id="server-count" class="server-count">0</span>
+          </div>
+        </div>
+        <div class="search-box">
+          <input type="text" id="search-input" placeholder="Search servers..." />
+        </div>
+        <div id="server-list" class="server-list">
+          <div class="loading">Loading servers...</div>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      <button id="refresh-btn" class="footer-btn" title="Refresh servers">⟳</button>
+      <button id="settings-btn" class="footer-btn" title="Settings">⚙</button>
+    </footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "Happ Custom VPN",
+  "version": "1.0.9",
+  "description": "VPN extension for Happ VPN with VLESS protocol support",
+  "permissions": [
+    "storage",
+    "debugger",
+    "declarativeNetRequest",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "src/sw.js"
+  },
+  "action": {
+    "default_title": "Happ Custom VPN",
+    "default_popup": "popup/popup.html"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
