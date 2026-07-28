@@ -192,20 +192,16 @@ async function disableProxy() {
 
 async function pingServer(config) {
   try {
+    const proto = config.security === 'tls' ? 'wss' : 'ws';
+    const url = `${proto}://${config.server}:${config.port}${config.path}`;
     const start = Date.now();
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    const resp = await fetch(`http://${config.host}:${config.port}${config.path}`, {
-      method: 'GET',
-      signal: controller.signal,
-      headers: { 'Host': config.host + ':' + config.port }
-    }).catch(() => null);
-    clearTimeout(timeout);
-    if (resp) {
-      resp.body?.cancel();
-      return Date.now() - start;
-    }
-    return -1;
+    const ws = new WebSocket(url);
+    await new Promise((resolve, reject) => {
+      ws.onopen = () => { ws.close(); resolve(); };
+      ws.onerror = () => reject(new Error('WS error'));
+      setTimeout(() => { try { ws.close(); } catch {} reject(new Error('timeout')); }, 5000);
+    });
+    return Date.now() - start;
   } catch {
     return -1;
   }
@@ -300,8 +296,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     case 'CONNECT':
       connectToServer(msg.serverName)
-        .then(n => sendResponse({ success: true, serverName: n }))
-        .catch(e => sendResponse({ success: false, error: e.message }));
+        .then(n => {
+          console.log('CONNECT success:', n);
+          sendResponse({ success: true, serverName: n });
+        })
+        .catch(e => {
+          console.error('CONNECT error:', e);
+          sendResponse({ success: false, error: e.message });
+        });
       return true;
 
     case 'DISCONNECT':

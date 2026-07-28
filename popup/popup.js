@@ -90,8 +90,8 @@ function renderServerList() {
     if (state.activeServer === s.name) item.classList.add('selected');
 
     const flagEmoji = getFlagEmoji(s.name);
-    const pingText = s.ping ? `${s.ping}ms` : '--';
-    const pingClass = s.ping ? (s.ping < 100 ? 'good' : s.ping < 250 ? 'ok' : 'bad') : '';
+    const pingText = s.ping > 0 ? `${s.ping}ms` : '--';
+    const pingClass = s.ping > 0 ? (s.ping < 100 ? 'good' : s.ping < 250 ? 'ok' : 'bad') : '';
 
     item.innerHTML = `
       <div class="server-flag">${flagEmoji}</div>
@@ -156,6 +156,8 @@ async function connectToServer(serverName) {
     type: 'CONNECT',
     serverName: targetServer
   });
+
+  console.log('CONNECT response:', resp);
 
   if (resp && resp.success) {
     state.connected = true;
