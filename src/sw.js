@@ -110,17 +110,21 @@ async function loadServers() {
   return serverList;
 }
 
-async function addHostHeaderRule(server, host, port) {
+async function addHostHeaderRules(serverList) {
   try {
+    // Remove all existing host header rules first
+    const existing = await chrome.declarativeNetRequest.getDynamicRules();
+    const toRemove = existing.map(r => r.id).filter(id => id !== 1);
+    const rules = serverList.map((s, i) => ({
+      id: 100 + i, priority: 1,
+      action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: s.host + ':' + s.port }] },
+      condition: { urlFilter: `||${s.server}` }
+    }));
     await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [2],
-      addRules: [{
-        id: 2, priority: 1,
-        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: host + ':' + port }] },
-        condition: { urlFilter: `||${server}` }
-      }]
+      removeRuleIds: toRemove,
+      addRules: rules
     });
-  } catch (e) { console.error('DNR add rule failed:', e); }
+  } catch (e) { console.error('DNR add rules failed:', e); }
 }
 
 async function addSubFetchRule(subUrl) {
@@ -142,9 +146,11 @@ async function addSubFetchRule(subUrl) {
   } catch (e) { console.error('DNR add fetch rule failed:', e); }
 }
 
-async function removeHostHeaderRule() {
+async function clearDynamicRules() {
   try {
-    await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [1, 2], addRules: [] });
+    const existing = await chrome.declarativeNetRequest.getDynamicRules();
+    const ids = existing.map(r => r.id);
+    if (ids.length) await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: ids, addRules: [] });
   } catch {}
 }
 
@@ -325,7 +331,7 @@ async function connectToServer(serverName) {
   await saveStats(stats);
   await chrome.storage.local.set({ connected: true, activeServer: config });
 
-  await addHostHeaderRule(config.server, config.host, config.port);
+  await addHostHeaderRules(serverList);
 
   const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   let tab = tabs?.[0];
@@ -360,7 +366,8 @@ async function connectToServer(serverName) {
 }
 
 async function disconnect() {
-  await removeHostHeaderRule();
+  await clearDynamicRules();
+  await addSubFetchRule(await getSubUrl());
   chrome.debugger.onEvent.removeListener(onDebuggerEvent);
   chrome.debugger.onDetach.removeListener(onDebuggerDetach);
 
