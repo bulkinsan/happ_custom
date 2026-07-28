@@ -156,7 +156,7 @@ async function pingServer(config) {
       setTimeout(() => { ws.close(); reject(); }, 3000);
     } catch { reject(); }
   });
-  const protos = config.security === 'tls' ? ['wss'] : config.port === 443 ? ['wss', 'ws'] : ['ws', 'wss'];
+  const protos = ['wss', 'ws'];
   for (const p of protos) {
     const result = await tryProto(p).catch(() => null);
     if (result !== null) return result;
