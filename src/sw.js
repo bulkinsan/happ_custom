@@ -91,10 +91,8 @@ async function fetchSubscription() {
   }
   const lines = decoded.split('\n').filter(l => l.trim());
   console.log('Decoded lines:', lines.length);
-  if (lines.length > 0) console.log('First URL:', lines[0].slice(0, 120));
   const parsed = lines.map(parseVlessUrl).filter(s => s && s.type === 'ws');
   console.log('WS servers found:', parsed.length);
-  if (parsed.length > 0) console.log('Sample server:', JSON.stringify({ server: parsed[0].server, port: parsed[0].port, path: parsed[0].path, security: parsed[0].security }));
   return parsed;
 }
 
