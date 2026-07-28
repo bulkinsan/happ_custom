@@ -153,11 +153,11 @@ async function addHostHeaderRule(server, host, port) {
       addRules: [{
         id: 2, priority: 1,
         action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: host + ':' + port }] },
-        condition: { urlFilter: `||${server}`, resourceTypes: ['websocket'] }
+        condition: { urlFilter: `||${server}` }
       }]
     });
   } catch (e) { console.error('DNR add rule failed:', e); }
-  console.log('DNR rule set: Host ->', host + ':' + port, '(websocket only)');
+  console.log('DNR rule set: Host ->', host + ':' + port);
 }
 
 async function clearDynamicRules() {
