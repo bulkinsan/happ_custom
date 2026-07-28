@@ -348,6 +348,7 @@ async function saveStats(stats) {
 }
 
 async function connectToServer(serverName) {
+  console.log('connectToServer called with:', serverName);
   let config;
   if (!serverName || serverName === 'auto') {
     const pings = await Promise.allSettled(serverList.map(async s => ({ s, ping: await pingServer(s) })));
@@ -380,7 +381,11 @@ async function connectToServer(serverName) {
         });
         await injectWsProxy(tab.id);
         console.log('Debugger attached and WS proxy injected to tab', tab.id);
-      } catch {}
+      } catch (e) {
+        console.error('Failed to setup debugger/proxy on tab', tab.id, tab.url, e);
+      }
+    } else {
+      console.warn('Skipping tab, unsupported URL:', tab?.url);
     }
   }
 
