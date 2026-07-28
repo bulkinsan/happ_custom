@@ -1,6 +1,7 @@
 let activeConfig = null;
 let isConnected = false;
 let serverList = [];
+let connecting = false;
 
 function uuidToBytes(uuid) {
   const hex = uuid.replace(/-/g, '');
@@ -149,63 +150,60 @@ async function removeHostHeaderRule() {
 
 let proxyTabId = null;
 
-function injectWsProxy(tabId) {
-  return chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      const pending = {};
-      chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-        if (msg.type === 'WS_CREATE') {
-          const ws = new WebSocket(msg.url);
-          ws.onopen = () => { chrome.runtime.sendMessage({ type: 'WS_OPEN', reqId: msg.reqId }); sendResponse({ ok: true }); };
-          ws.onmessage = async (e) => {
-            const buf = await e.data.arrayBuffer();
-            chrome.runtime.sendMessage({ type: 'WS_DATA', reqId: msg.reqId, data: Array.from(new Uint8Array(buf)) });
-          };
-          ws.onerror = () => chrome.runtime.sendMessage({ type: 'WS_ERR', reqId: msg.reqId });
-          pending[msg.reqId] = ws;
-          return true;
-        }
-        if (msg.type === 'WS_SEND') {
-          const ws = pending[msg.reqId];
-          if (ws && ws.readyState === WebSocket.OPEN) { ws.send(new Uint8Array(msg.data)); sendResponse({ ok: true }); }
-          else sendResponse({ ok: false });
-        }
-      });
-      console.log('WS proxy content script loaded');
-    }
-  }).catch(e => console.error('Inject WS proxy failed:', e));
-}
-
-function createProxyRequestId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-}
-
 async function pingServer(config) {
-  return -1;
+  const proto = config.security === 'tls' ? 'wss' : 'ws';
+  const url = `${proto}://${config.server}:${config.port}${config.path}`;
+  const start = Date.now();
+  try {
+    const ws = new WebSocket(url);
+    await new Promise((resolve, reject) => {
+      ws.onopen = () => { ws.close(); resolve(); };
+      ws.onerror = (e) => { reject(new Error('WS error')); };
+      setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 5000);
+    });
+    return Date.now() - start;
+  } catch {
+    return -1;
+  }
 }
 
 async function proxyHttpRequest(config, method, host, port, path, headers, body) {
   const proto = config.security === 'tls' ? 'wss' : 'ws';
   const url = `${proto}://${config.server}:${config.port}${config.path}`;
-  const reqId = createProxyRequestId();
-  const tabId = proxyTabId;
-  if (!tabId) throw new Error('No tab for proxy');
 
+  const ws = new WebSocket(url);
   const openPromise = new Promise((resolve, reject) => {
-    const handler = (msg) => {
-      if (msg.type === 'WS_OPEN' && msg.reqId === reqId) { chrome.runtime.onMessage.removeListener(handler); resolve(); }
-      if (msg.type === 'WS_ERR' && msg.reqId === reqId) { chrome.runtime.onMessage.removeListener(handler); reject(new Error('WS connect failed')); }
-    };
-    chrome.runtime.onMessage.addListener(handler);
-    setTimeout(() => { chrome.runtime.onMessage.removeListener(handler); reject(new Error('WS timeout')); }, 10000);
+    ws.onopen = resolve;
+    ws.onerror = () => reject(new Error('WS connect failed'));
+    setTimeout(() => reject(new Error('WS timeout')), 10000);
   });
+  await openPromise;
 
-  const respPromise = new Promise((resolve, reject) => {
+  const handshake = buildVlessHandshake(config, host, port);
+  ws.send(handshake);
+
+  let req = `${method} ${path} HTTP/1.1\r\nHost: ${host}${port !== 80 && port !== 443 ? ':' + port : ''}\r\n`;
+  for (const [k, v] of headers) {
+    if (k.toLowerCase() !== 'host') req += `${k}: ${v}\r\n`;
+  }
+  req += '\r\n';
+  const encoder = new TextEncoder();
+  const reqBytes = encoder.encode(req);
+  let bodyBytes = new Uint8Array(0);
+  if (body) {
+    if (typeof body === 'string') bodyBytes = encoder.encode(body);
+    else if (body instanceof ArrayBuffer) bodyBytes = new Uint8Array(body);
+  }
+  const full = new Uint8Array(reqBytes.length + bodyBytes.length);
+  full.set(reqBytes, 0);
+  full.set(bodyBytes, reqBytes.length);
+  ws.send(full);
+
+  return new Promise((resolve, reject) => {
     const chunks = [];
-    const handler = async (msg) => {
-      if (msg.type === 'WS_DATA' && msg.reqId === reqId) {
-        const bytes = new Uint8Array(msg.data);
+    ws.onmessage = (e) => {
+      e.data.arrayBuffer().then(buf => {
+        const bytes = new Uint8Array(buf);
         chunks.push(bytes);
         const fullResp = concatU8(chunks);
         const hEnd = indexOf(fullResp, new Uint8Array([13, 10, 13, 10]));
@@ -241,60 +239,17 @@ async function proxyHttpRequest(config, method, host, port, path, headers, body)
           bodyData = fullResp.slice(bodyStart);
         }
 
-        chrome.runtime.onMessage.removeListener(handler);
+        ws.close();
         resolve(new Response(bodyData, {
           status: code,
           statusText: lines[0].split(' ').slice(2).join(' ') || 'OK',
           headers: Object.entries(respHeaders)
         }));
-      }
+      });
     };
-    chrome.runtime.onMessage.addListener(handler);
-    setTimeout(() => { chrome.runtime.onMessage.removeListener(handler); resolve(makeResponse(concatU8(chunks))); }, 30000);
+    ws.onerror = () => reject(new Error('WS error'));
+    setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 30000);
   });
-
-  await chrome.tabs.sendMessage(tabId, { type: 'WS_CREATE', url, reqId });
-  await openPromise;
-
-  const handshake = buildVlessHandshake(config, host, port);
-  await chrome.tabs.sendMessage(tabId, { type: 'WS_SEND', reqId, data: Array.from(handshake) });
-
-  let req = `${method} ${path} HTTP/1.1\r\nHost: ${host}${port !== 80 && port !== 443 ? ':' + port : ''}\r\n`;
-  for (const [k, v] of headers) {
-    if (k.toLowerCase() !== 'host') req += `${k}: ${v}\r\n`;
-  }
-  req += '\r\n';
-  const encoder = new TextEncoder();
-  const reqBytes = encoder.encode(req);
-  let bodyBytes = new Uint8Array(0);
-  if (body) {
-    if (typeof body === 'string') bodyBytes = encoder.encode(body);
-    else if (body instanceof ArrayBuffer) bodyBytes = new Uint8Array(body);
-  }
-  const full = new Uint8Array(reqBytes.length + bodyBytes.length);
-  full.set(reqBytes, 0);
-  full.set(bodyBytes, reqBytes.length);
-  await chrome.tabs.sendMessage(tabId, { type: 'WS_SEND', reqId, data: Array.from(full) });
-
-  return await respPromise;
-}
-
-function makeResponse(data, code = 200, statusLine = 'HTTP/1.1 200 OK', headers = {}) {
-  if (!code && data.length > 0) {
-    const hEnd = indexOf(data, new Uint8Array([13, 10, 13, 10]));
-    if (hEnd > 0) {
-      const headerStr = new TextDecoder().decode(data.slice(0, hEnd));
-      const lines = headerStr.split('\r\n');
-      const parts = lines[0].split(' ');
-      code = parseInt(parts[1]) || 200;
-      for (let i = 1; i < lines.length; i++) {
-        const ci = lines[i].indexOf(':');
-        if (ci > 0) headers[lines[i].slice(0, ci).trim().toLowerCase()] = lines[i].slice(ci + 1).trim();
-      }
-      data = data.slice(hEnd + 4);
-    }
-  }
-  return new Response(data, { status: code, statusText: 'OK', headers: Object.entries(headers) });
 }
 
 function concatU8(chunks) {
@@ -348,6 +303,8 @@ async function saveStats(stats) {
 }
 
 async function connectToServer(serverName) {
+  if (connecting) throw new Error('Already connecting');
+  connecting = true;
   console.log('connectToServer called with:', serverName);
   let config;
   if (!serverName || serverName === 'auto') {
@@ -373,7 +330,6 @@ async function connectToServer(serverName) {
   const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   let tab = tabs?.[0];
   if (!tab || !tab.url || tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
-    console.warn('Active tab not suitable, trying any non-restricted tab.');
     const all = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] });
     tab = all?.[0];
   }
@@ -386,18 +342,20 @@ async function connectToServer(serverName) {
           { urlPattern: 'http://*/*', requestStage: 'request' }
         ]
       });
-      await injectWsProxy(tab.id);
-      console.log('Debugger + WS proxy ready on tab', tab.id, tab.url);
+      console.log('Debugger ready on tab', tab.id, tab.url);
     } catch (e) {
-      console.error('Setup failed:', e);
+      console.error('Debugger attach failed:', e);
     }
   } else {
-    console.error('No suitable tab for proxy. Open a regular web page and try again.');
+    console.error('No suitable tab for proxy.');
   }
 
+  chrome.debugger.onEvent.removeListener(onDebuggerEvent);
   chrome.debugger.onEvent.addListener(onDebuggerEvent);
+  chrome.debugger.onDetach.removeListener(onDebuggerDetach);
   chrome.debugger.onDetach.addListener(onDebuggerDetach);
 
+  connecting = false;
   return config.name;
 }
 
@@ -431,7 +389,6 @@ function onDebuggerDetach(source) {
           { urlPattern: 'http://*/*', requestStage: 'request' }
         ]
       });
-      await injectWsProxy(source.tabId);
       console.log('Debugger re-attached to tab', source.tabId);
     } catch (e) {
       console.error('Re-attach failed:', e);
@@ -497,7 +454,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       (async () => {
         const results = [];
         for (const s of serverList) {
-          results.push({ name: s.name, ping: -1 });
+          const p = await pingServer(s);
+          results.push({ name: s.name, ping: p });
         }
         sendResponse({ results });
       })();
