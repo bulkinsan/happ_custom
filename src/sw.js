@@ -147,35 +147,116 @@ async function removeHostHeaderRule() {
   } catch {}
 }
 
+let proxyTabId = null;
+
+function injectWsProxy(tabId) {
+  return chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const pending = {};
+      chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+        if (msg.type === 'WS_CREATE') {
+          const ws = new WebSocket(msg.url);
+          ws.onopen = () => { chrome.runtime.sendMessage({ type: 'WS_OPEN', reqId: msg.reqId }); sendResponse({ ok: true }); };
+          ws.onmessage = async (e) => {
+            const buf = await e.data.arrayBuffer();
+            chrome.runtime.sendMessage({ type: 'WS_DATA', reqId: msg.reqId, data: Array.from(new Uint8Array(buf)) });
+          };
+          ws.onerror = () => chrome.runtime.sendMessage({ type: 'WS_ERR', reqId: msg.reqId });
+          pending[msg.reqId] = ws;
+          return true;
+        }
+        if (msg.type === 'WS_SEND') {
+          const ws = pending[msg.reqId];
+          if (ws && ws.readyState === WebSocket.OPEN) { ws.send(new Uint8Array(msg.data)); sendResponse({ ok: true }); }
+          else sendResponse({ ok: false });
+        }
+      });
+    }
+  }).catch(e => console.error('Inject WS proxy failed:', e));
+}
+
+function createProxyRequestId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
 async function pingServer(config) {
-  const start = Date.now();
-  const tryProto = (proto) => new Promise((resolve, reject) => {
-    try {
-      const url = `${proto}://${config.server}:${config.port}${config.path}`;
-      const ws = new WebSocket(url);
-      ws.onopen = () => { ws.close(); resolve(Date.now() - start); };
-      ws.onerror = () => reject();
-      setTimeout(() => { ws.close(); reject(); }, 3000);
-    } catch { reject(); }
-  });
-  const protos = ['wss', 'ws'];
-  for (const p of protos) {
-    const result = await tryProto(p).catch(() => null);
-    if (result !== null) return result;
-  }
   return -1;
 }
 
 async function proxyHttpRequest(config, method, host, port, path, headers, body) {
   const proto = config.security === 'tls' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${config.server}:${config.port}${config.path}`);
+  const url = `${proto}://${config.server}:${config.port}${config.path}`;
+  const reqId = createProxyRequestId();
+  const tabId = proxyTabId;
+  if (!tabId) throw new Error('No tab for proxy');
 
-  await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = (e) => reject(new Error('WebSocket connection failed'));
+  const openPromise = new Promise((resolve, reject) => {
+    const handler = (msg) => {
+      if (msg.type === 'WS_OPEN' && msg.reqId === reqId) { chrome.runtime.onMessage.removeListener(handler); resolve(); }
+      if (msg.type === 'WS_ERR' && msg.reqId === reqId) { chrome.runtime.onMessage.removeListener(handler); reject(new Error('WS connect failed')); }
+    };
+    chrome.runtime.onMessage.addListener(handler);
+    setTimeout(() => { chrome.runtime.onMessage.removeListener(handler); reject(new Error('WS timeout')); }, 10000);
   });
 
-  ws.send(buildVlessHandshake(config, host, port));
+  const respPromise = new Promise((resolve, reject) => {
+    const chunks = [];
+    const handler = async (msg) => {
+      if (msg.type === 'WS_DATA' && msg.reqId === reqId) {
+        const bytes = new Uint8Array(msg.data);
+        chunks.push(bytes);
+        const fullResp = concatU8(chunks);
+        const hEnd = indexOf(fullResp, new Uint8Array([13, 10, 13, 10]));
+        if (hEnd === -1) return;
+
+        const headerStr = new TextDecoder().decode(fullResp.slice(0, hEnd));
+        const lines = headerStr.split('\r\n');
+        const code = parseInt(lines[0].split(' ')[1]) || 200;
+        const respHeaders = {};
+        let isChunked = false;
+        let cl = -1;
+        for (let i = 1; i < lines.length; i++) {
+          const ci = lines[i].indexOf(':');
+          if (ci > 0) {
+            const k = lines[i].slice(0, ci).trim().toLowerCase();
+            const v = lines[i].slice(ci + 1).trim();
+            respHeaders[k] = v;
+            if (k === 'content-length') cl = parseInt(v);
+            if (k === 'transfer-encoding' && v.includes('chunked')) isChunked = true;
+          }
+        }
+
+        const bodyStart = hEnd + 4;
+        let bodyData;
+        if (isChunked) {
+          bodyData = decodeChunked(fullResp.slice(bodyStart));
+          delete respHeaders['transfer-encoding'];
+        } else if (cl >= 0 && fullResp.length >= bodyStart + cl) {
+          bodyData = fullResp.slice(bodyStart, bodyStart + cl);
+        } else if (cl >= 0) {
+          return;
+        } else {
+          bodyData = fullResp.slice(bodyStart);
+        }
+
+        chrome.runtime.onMessage.removeListener(handler);
+        resolve(new Response(bodyData, {
+          status: code,
+          statusText: lines[0].split(' ').slice(2).join(' ') || 'OK',
+          headers: Object.entries(respHeaders)
+        }));
+      }
+    };
+    chrome.runtime.onMessage.addListener(handler);
+    setTimeout(() => { chrome.runtime.onMessage.removeListener(handler); resolve(makeResponse(concatU8(chunks))); }, 30000);
+  });
+
+  await chrome.tabs.sendMessage(tabId, { type: 'WS_CREATE', url, reqId });
+  await openPromise;
+
+  const handshake = buildVlessHandshake(config, host, port);
+  await chrome.tabs.sendMessage(tabId, { type: 'WS_SEND', reqId, data: Array.from(handshake) });
 
   let req = `${method} ${path} HTTP/1.1\r\nHost: ${host}${port !== 80 && port !== 443 ? ':' + port : ''}\r\n`;
   for (const [k, v] of headers) {
@@ -192,62 +273,9 @@ async function proxyHttpRequest(config, method, host, port, path, headers, body)
   const full = new Uint8Array(reqBytes.length + bodyBytes.length);
   full.set(reqBytes, 0);
   full.set(bodyBytes, reqBytes.length);
-  ws.send(full);
+  await chrome.tabs.sendMessage(tabId, { type: 'WS_SEND', reqId, data: Array.from(full) });
 
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let timeout = setTimeout(() => { ws.close(); resolve(makeResponse(concatU8(chunks))); }, 30000);
-
-    ws.onmessage = async (e) => {
-      clearTimeout(timeout);
-      const data = await (e.data instanceof Blob ? e.data.arrayBuffer() : Promise.resolve(e.data));
-      chunks.push(new Uint8Array(data));
-      const fullResp = concatU8(chunks);
-      const hEnd = indexOf(fullResp, new Uint8Array([13, 10, 13, 10]));
-      if (hEnd === -1) { timeout = setTimeout(() => resolve(makeResponse(fullResp)), 30000); return; }
-
-      const headerStr = new TextDecoder().decode(fullResp.slice(0, hEnd));
-      const lines = headerStr.split('\r\n');
-      const statusParts = lines[0].split(' ');
-      const code = parseInt(statusParts[1]) || 200;
-      const respHeaders = {};
-      let isChunked = false;
-      let cl = -1;
-      for (let i = 1; i < lines.length; i++) {
-        const ci = lines[i].indexOf(':');
-        if (ci > 0) {
-          const k = lines[i].slice(0, ci).trim().toLowerCase();
-          const v = lines[i].slice(ci + 1).trim();
-          respHeaders[k] = v;
-          if (k === 'content-length') cl = parseInt(v);
-          if (k === 'transfer-encoding' && v.includes('chunked')) isChunked = true;
-        }
-      }
-
-      const bodyStart = hEnd + 4;
-      let bodyData;
-      if (isChunked) {
-        bodyData = decodeChunked(fullResp.slice(bodyStart));
-        delete respHeaders['transfer-encoding'];
-      } else if (cl >= 0 && fullResp.length >= bodyStart + cl) {
-        bodyData = fullResp.slice(bodyStart, bodyStart + cl);
-      } else if (cl >= 0) {
-        timeout = setTimeout(() => resolve(makeResponse(fullResp.slice(bodyStart), code, lines[0], respHeaders)), 10000);
-        return;
-      } else {
-        bodyData = fullResp.slice(bodyStart);
-      }
-
-      ws.close();
-      resolve(new Response(bodyData, {
-        status: code,
-        statusText: statusParts.slice(2).join(' ') || 'OK',
-        headers: Object.entries(respHeaders)
-      }));
-    };
-    ws.onerror = () => { clearTimeout(timeout); reject(new Error('WS error')); };
-    ws.onclose = () => { clearTimeout(timeout); if (chunks.length) resolve(makeResponse(concatU8(chunks))); else reject(new Error('WS closed')); };
-  });
+  return await respPromise;
 }
 
 function makeResponse(data, code = 200, statusLine = 'HTTP/1.1 200 OK', headers = {}) {
@@ -344,10 +372,12 @@ async function connectToServer(serverName) {
   for (const tab of tabs) {
     if (tab.url && !tab.url.startsWith('chrome://') && !tab.url.startsWith('chrome-extension://')) {
       try {
+        proxyTabId = tab.id;
         await chrome.debugger.attach({ tabId: tab.id }, '1.3');
         await chrome.debugger.sendCommand({ tabId: tab.id }, 'Fetch.enable', {
           patterns: [{ urlPattern: '*', requestStage: 'request' }]
         });
+        injectWsProxy(tab.id);
       } catch {}
     }
   }
@@ -361,6 +391,7 @@ async function connectToServer(serverName) {
 }
 
 async function disconnect() {
+  proxyTabId = null;
   await removeHostHeaderRule();
   chrome.tabs.onActivated.removeListener(onTabActivated);
   chrome.tabs.onCreated.removeListener(onTabCreated);
@@ -384,10 +415,12 @@ async function disconnect() {
 async function onTabActivated(info) {
   if (!isConnected) return;
   try {
+    proxyTabId = info.tabId;
     await chrome.debugger.attach({ tabId: info.tabId }, '1.3');
     await chrome.debugger.sendCommand({ tabId: info.tabId }, 'Fetch.enable', {
       patterns: [{ urlPattern: '*', requestStage: 'request' }]
     });
+    injectWsProxy(info.tabId);
   } catch {}
 }
 
@@ -396,10 +429,12 @@ async function onTabCreated(tab) {
   const listener = async (tabId, info) => {
     if (tabId === tab.id && info.status === 'loading') {
       try {
+        proxyTabId = tabId;
         await chrome.debugger.attach({ tabId }, '1.3');
         await chrome.debugger.sendCommand({ tabId }, 'Fetch.enable', {
           patterns: [{ urlPattern: '*', requestStage: 'request' }]
         });
+        injectWsProxy(tabId);
       } catch {}
       chrome.tabs.onUpdated.removeListener(listener);
     }
@@ -425,6 +460,28 @@ async function onDebuggerEvent(source, method, params) {
   const url = request.url;
 
   try {
+    if (url.startsWith('ws://') || url.startsWith('wss://')) {
+      const parsed = new URL(url);
+      if (activeConfig && parsed.hostname === activeConfig.server) {
+        const reqHeaders = [];
+        for (const [name, value] of Object.entries(request.headers || {})) {
+          reqHeaders.push({ name, value: name.toLowerCase() === 'host' ? activeConfig.host : value });
+        }
+        await chrome.debugger.sendCommand(
+          { tabId: source.tabId, sessionId: source.sessionId },
+          'Fetch.continueRequest',
+          { requestId, headers: reqHeaders }
+        );
+      } else {
+        await chrome.debugger.sendCommand(
+          { tabId: source.tabId, sessionId: source.sessionId },
+          'Fetch.continueRequest',
+          { requestId }
+        );
+      }
+      return;
+    }
+
     if (url.startsWith('http://') && activeConfig) {
       const parsed = new URL(url);
       const hdrs = Array.isArray(request.headers) ? request.headers.map(h => [h.name, h.value]) : Object.entries(request.headers || {});
@@ -475,17 +532,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'PING_ALL':
       (async () => {
         const results = [];
-        const rules = serverList.map((s, i) => ({
-          id: 100 + i, priority: 1,
-          action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: s.host }] },
-          condition: { urlFilter: `||${s.server}`, resourceTypes: ['websocket'] }
-        }));
-        if (rules.length) await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: rules.map(r => r.id), addRules: rules });
         for (const s of serverList) {
-          const ping = await pingServer(s);
-          results.push({ name: s.name, ping });
+          results.push({ name: s.name, ping: -1 });
         }
-        if (rules.length) await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: rules.map(r => r.id) });
         sendResponse({ results });
       })();
       return true;
