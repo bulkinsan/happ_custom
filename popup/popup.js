@@ -255,7 +255,6 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   document.getElementById('ver-display').textContent = 'v' + chrome.runtime.getManifest().version;
-});
 
   document.getElementById('search-input').addEventListener('input', (e) => {
     const query = e.target.value.toLowerCase();

@@ -170,33 +170,6 @@ async function clearDynamicRules() {
 
 let proxyTabId = null;
 
-function injectWsProxy(tabId) {
-  return chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      const pending = {};
-      chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-        if (msg.type === 'WS_CREATE') {
-          const ws = new WebSocket(msg.url);
-          ws.onopen = () => { chrome.runtime.sendMessage({ type: 'WS_OPEN', reqId: msg.reqId }); sendResponse({ ok: true }); };
-          ws.onmessage = async (e) => {
-            const buf = await e.data.arrayBuffer();
-            chrome.runtime.sendMessage({ type: 'WS_DATA', reqId: msg.reqId, data: Array.from(new Uint8Array(buf)) });
-          };
-          ws.onerror = () => chrome.runtime.sendMessage({ type: 'WS_ERR', reqId: msg.reqId });
-          pending[msg.reqId] = ws;
-          return true;
-        }
-        if (msg.type === 'WS_SEND') {
-          const ws = pending[msg.reqId];
-          if (ws && ws.readyState === WebSocket.OPEN) { ws.send(new Uint8Array(msg.data)); sendResponse({ ok: true }); }
-          else sendResponse({ ok: false });
-        }
-      });
-    }
-  }).catch(e => console.error('injectWsProxy failed:', e));
-}
-
 async function pingServer(config) {
   try {
     const proto = config.security === 'tls' ? 'wss' : 'ws';
@@ -217,24 +190,40 @@ async function pingServer(config) {
 async function proxyHttpRequest(config, method, host, port, path, headers, body) {
   const proto = config.security === 'tls' ? 'wss' : 'ws';
   const url = `${proto}://${config.server}:${config.port}${config.path}`;
-  const reqId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const tabId = proxyTabId;
-  if (!tabId) throw new Error('No tab for proxy');
 
+  const ws = new WebSocket(url);
   const openPromise = new Promise((resolve, reject) => {
-    const handler = (msg) => {
-      if (msg.type === 'WS_OPEN' && msg.reqId === reqId) { chrome.runtime.onMessage.removeListener(handler); resolve(); }
-      if (msg.type === 'WS_ERR' && msg.reqId === reqId) { chrome.runtime.onMessage.removeListener(handler); reject(new Error('WS connect failed')); }
-    };
-    chrome.runtime.onMessage.addListener(handler);
-    setTimeout(() => { chrome.runtime.onMessage.removeListener(handler); reject(new Error('WS timeout')); }, 10000);
+    ws.onopen = resolve;
+    ws.onerror = () => reject(new Error('WS connect failed'));
+    setTimeout(() => reject(new Error('WS timeout')), 10000);
   });
+  await openPromise;
 
-  const respPromise = new Promise((resolve, reject) => {
+  const handshake = buildVlessHandshake(config, host, port);
+  ws.send(handshake);
+
+  let req = `${method} ${path} HTTP/1.1\r\nHost: ${host}${port !== 80 && port !== 443 ? ':' + port : ''}\r\n`;
+  for (const [k, v] of headers) {
+    if (k.toLowerCase() !== 'host') req += `${k}: ${v}\r\n`;
+  }
+  req += '\r\n';
+  const encoder = new TextEncoder();
+  const reqBytes = encoder.encode(req);
+  let bodyBytes = new Uint8Array(0);
+  if (body) {
+    if (typeof body === 'string') bodyBytes = encoder.encode(body);
+    else if (body instanceof ArrayBuffer) bodyBytes = new Uint8Array(body);
+  }
+  const full = new Uint8Array(reqBytes.length + bodyBytes.length);
+  full.set(reqBytes, 0);
+  full.set(bodyBytes, reqBytes.length);
+  ws.send(full);
+
+  return new Promise((resolve, reject) => {
     const chunks = [];
-    const handler = async (msg) => {
-      if (msg.type === 'WS_DATA' && msg.reqId === reqId) {
-        const bytes = new Uint8Array(msg.data);
+    ws.onmessage = (e) => {
+      e.data.arrayBuffer().then(buf => {
+        const bytes = new Uint8Array(buf);
         chunks.push(bytes);
         const fullResp = concatU8(chunks);
         const hEnd = indexOf(fullResp, new Uint8Array([13, 10, 13, 10]));
@@ -270,42 +259,17 @@ async function proxyHttpRequest(config, method, host, port, path, headers, body)
           bodyData = fullResp.slice(bodyStart);
         }
 
-        chrome.runtime.onMessage.removeListener(handler);
+        ws.close();
         resolve(new Response(bodyData, {
           status: code,
           statusText: lines[0].split(' ').slice(2).join(' ') || 'OK',
           headers: Object.entries(respHeaders)
         }));
-      }
+      });
     };
-    chrome.runtime.onMessage.addListener(handler);
-    setTimeout(() => { chrome.runtime.onMessage.removeListener(handler); resolve(new Response(concatU8(chunks), { status: 200 })); }, 30000);
+    ws.onerror = () => reject(new Error('WS error'));
+    setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 30000);
   });
-
-  await chrome.tabs.sendMessage(tabId, { type: 'WS_CREATE', url, reqId });
-  await openPromise;
-
-  const handshake = buildVlessHandshake(config, host, port);
-  await chrome.tabs.sendMessage(tabId, { type: 'WS_SEND', reqId, data: Array.from(handshake) });
-
-  let req = `${method} ${path} HTTP/1.1\r\nHost: ${host}${port !== 80 && port !== 443 ? ':' + port : ''}\r\n`;
-  for (const [k, v] of headers) {
-    if (k.toLowerCase() !== 'host') req += `${k}: ${v}\r\n`;
-  }
-  req += '\r\n';
-  const encoder = new TextEncoder();
-  const reqBytes = encoder.encode(req);
-  let bodyBytes = new Uint8Array(0);
-  if (body) {
-    if (typeof body === 'string') bodyBytes = encoder.encode(body);
-    else if (body instanceof ArrayBuffer) bodyBytes = new Uint8Array(body);
-  }
-  const full = new Uint8Array(reqBytes.length + bodyBytes.length);
-  full.set(reqBytes, 0);
-  full.set(bodyBytes, reqBytes.length);
-  await chrome.tabs.sendMessage(tabId, { type: 'WS_SEND', reqId, data: Array.from(full) });
-
-  return await respPromise;
 }
 
 function concatU8(chunks) {
@@ -400,13 +364,10 @@ async function connectToServer(serverName) {
       await chrome.debugger.attach({ tabId: tab.id }, '1.3');
       await chrome.debugger.sendCommand({ tabId: tab.id }, 'Fetch.enable', {
         patterns: [
-          { urlPattern: 'http://*/*', requestStage: 'request' },
-          { urlPattern: `ws://${config.server}/*`, requestStage: 'request' },
-          { urlPattern: `wss://${config.server}/*`, requestStage: 'request' }
+          { urlPattern: 'http://*/*', requestStage: 'request' }
         ]
       });
-      await injectWsProxy(tab.id);
-      console.log('Debugger + content script ready on tab', tab.id);
+      console.log('Debugger ready on tab', tab.id);
       console.log('Debugger ready on tab', tab.id, tab.url);
     } catch (e) {
       console.error('Debugger attach failed:', e);
@@ -453,12 +414,9 @@ function onDebuggerDetach(source) {
       await chrome.debugger.attach({ tabId: source.tabId }, '1.3');
       await chrome.debugger.sendCommand({ tabId: source.tabId }, 'Fetch.enable', {
         patterns: [
-          { urlPattern: 'http://*/*', requestStage: 'request' },
-          { urlPattern: `ws://${activeConfig.server}/*`, requestStage: 'request' },
-          { urlPattern: `wss://${activeConfig.server}/*`, requestStage: 'request' }
+          { urlPattern: 'http://*/*', requestStage: 'request' }
         ]
       });
-      await injectWsProxy(source.tabId);
       console.log('Debugger re-attached to tab', source.tabId);
     } catch (e) {
       console.error('Re-attach failed:', e);
@@ -472,25 +430,6 @@ async function onDebuggerEvent(source, method, params) {
   const url = request.url;
 
   try {
-    if ((url.startsWith('ws://') || url.startsWith('wss://')) && activeConfig) {
-      const parsed = new URL(url);
-      const reqHeaders = [];
-      const entries = Array.isArray(request.headers) ? request.headers.map(h => [h.name, h.value]) : Object.entries(request.headers || {});
-      for (const [name, value] of entries) {
-        if (name.toLowerCase() === 'host') {
-          reqHeaders.push({ name, value: activeConfig.host + ':' + parsed.port });
-        } else {
-          reqHeaders.push({ name, value });
-        }
-      }
-      await chrome.debugger.sendCommand(
-        { tabId: source.tabId, sessionId: source.sessionId },
-        'Fetch.continueRequest',
-        { requestId, headers: reqHeaders }
-      );
-      return;
-    }
-
     if (url.startsWith('http://') && activeConfig) {
       const parsed = new URL(url);
       const hdrs = Array.isArray(request.headers) ? request.headers.map(h => [h.name, h.value]) : Object.entries(request.headers || {});
