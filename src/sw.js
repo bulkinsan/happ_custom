@@ -152,7 +152,7 @@ async function addHostHeaderRule(server, host, port) {
       removeRuleIds: [2],
       addRules: [{
         id: 2, priority: 1,
-        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: host }] },
+        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: host + ':' + port }] },
         condition: { urlFilter: `||${server}` }
       }]
     });
@@ -169,35 +169,6 @@ async function clearDynamicRules() {
 }
 
 let proxyTabId = null;
-let wsPort = null;
-let portReadyResolve = null;
-
-chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'ws-proxy') return;
-  wsPort = port;
-  if (portReadyResolve) { portReadyResolve(); portReadyResolve = null; }
-});
-
-async function ensureWsProxy() {
-  if (wsPort) return;
-  const ready = new Promise(resolve => { portReadyResolve = resolve; });
-  try {
-    await chrome.offscreen.createDocument({
-      url: 'offscreen/offscreen.html',
-      reasons: ['DOM_SCRAPING'],
-      justification: 'WebSocket proxy for VPN'
-    });
-  } catch (e) {
-    if (!e.message.includes('already exists')) throw e;
-  }
-  await ready;
-  console.log('Offscreen WS proxy ready');
-}
-
-async function closeWsProxy() {
-  try { await chrome.offscreen.closeDocument(); } catch {}
-  wsPort = null;
-}
 
 async function pingServer(config) {
   const proto = config.security === 'tls' ? 'wss' : 'ws';
@@ -217,26 +188,42 @@ async function pingServer(config) {
 }
 
 async function proxyHttpRequest(config, method, host, port, path, headers, body) {
-  console.log('proxyHttpRequest:', method, host);
-  if (!wsPort) throw new Error('No WS proxy available');
   const proto = config.security === 'tls' ? 'wss' : 'ws';
   const url = `${proto}://${config.server}:${config.port}${config.path}`;
-  const reqId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
+  const ws = new WebSocket(url);
   const openPromise = new Promise((resolve, reject) => {
-    const handler = (msg) => {
-      if (msg.type === 'WS_OPEN' && msg.reqId === reqId) { wsPort.onMessage.removeListener(handler); resolve(); }
-      if (msg.type === 'WS_ERR' && msg.reqId === reqId) { wsPort.onMessage.removeListener(handler); reject(new Error('WS connect failed')); }
-    };
-    wsPort.onMessage.addListener(handler);
-    setTimeout(() => { wsPort.onMessage.removeListener(handler); reject(new Error('WS timeout')); }, 10000);
+    ws.onopen = resolve;
+    ws.onerror = () => reject(new Error('WS connect failed'));
+    setTimeout(() => reject(new Error('WS timeout')), 10000);
   });
+  await openPromise;
 
-  const respPromise = new Promise((resolve, reject) => {
+  const handshake = buildVlessHandshake(config, host, port);
+  ws.send(handshake);
+
+  let req = `${method} ${path} HTTP/1.1\r\nHost: ${host}${port !== 80 && port !== 443 ? ':' + port : ''}\r\n`;
+  for (const [k, v] of headers) {
+    if (k.toLowerCase() !== 'host') req += `${k}: ${v}\r\n`;
+  }
+  req += '\r\n';
+  const encoder = new TextEncoder();
+  const reqBytes = encoder.encode(req);
+  let bodyBytes = new Uint8Array(0);
+  if (body) {
+    if (typeof body === 'string') bodyBytes = encoder.encode(body);
+    else if (body instanceof ArrayBuffer) bodyBytes = new Uint8Array(body);
+  }
+  const full = new Uint8Array(reqBytes.length + bodyBytes.length);
+  full.set(reqBytes, 0);
+  full.set(bodyBytes, reqBytes.length);
+  ws.send(full);
+
+  return new Promise((resolve, reject) => {
     const chunks = [];
-    const handler = async (msg) => {
-      if (msg.type === 'WS_DATA' && msg.reqId === reqId) {
-        const bytes = new Uint8Array(msg.data);
+    ws.onmessage = (e) => {
+      e.data.arrayBuffer().then(buf => {
+        const bytes = new Uint8Array(buf);
         chunks.push(bytes);
         const fullResp = concatU8(chunks);
         const hEnd = indexOf(fullResp, new Uint8Array([13, 10, 13, 10]));
@@ -272,42 +259,17 @@ async function proxyHttpRequest(config, method, host, port, path, headers, body)
           bodyData = fullResp.slice(bodyStart);
         }
 
-        wsPort.onMessage.removeListener(handler);
+        ws.close();
         resolve(new Response(bodyData, {
           status: code,
           statusText: lines[0].split(' ').slice(2).join(' ') || 'OK',
           headers: Object.entries(respHeaders)
         }));
-      }
+      });
     };
-    wsPort.onMessage.addListener(handler);
-    setTimeout(() => { wsPort.onMessage.removeListener(handler); resolve(new Response(concatU8(chunks), { status: 200 })); }, 30000);
+    ws.onerror = () => reject(new Error('WS error'));
+    setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 30000);
   });
-
-  wsPort.postMessage({ type: 'WS_CREATE', url, reqId });
-  await openPromise;
-
-  const handshake = buildVlessHandshake(config, host, port);
-  wsPort.postMessage({ type: 'WS_SEND', reqId, data: Array.from(handshake) });
-
-  let req = `${method} ${path} HTTP/1.1\r\nHost: ${host}${port !== 80 && port !== 443 ? ':' + port : ''}\r\n`;
-  for (const [k, v] of headers) {
-    if (k.toLowerCase() !== 'host') req += `${k}: ${v}\r\n`;
-  }
-  req += '\r\n';
-  const encoder = new TextEncoder();
-  const reqBytes = encoder.encode(req);
-  let bodyBytes = new Uint8Array(0);
-  if (body) {
-    if (typeof body === 'string') bodyBytes = encoder.encode(body);
-    else if (body instanceof ArrayBuffer) bodyBytes = new Uint8Array(body);
-  }
-  const full = new Uint8Array(reqBytes.length + bodyBytes.length);
-  full.set(reqBytes, 0);
-  full.set(bodyBytes, reqBytes.length);
-  wsPort.postMessage({ type: 'WS_SEND', reqId, data: Array.from(full) });
-
-  return await respPromise;
 }
 
 function concatU8(chunks) {
@@ -386,7 +348,6 @@ async function connectToServer(serverName) {
   await clearDynamicRules();
   await addSubFetchRule(await getSubUrl());
   await addHostHeaderRule(config.server, config.host, config.port);
-  await ensureWsProxy();
 
   const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   let tab = tabs?.[0];
@@ -430,8 +391,6 @@ async function disconnect() {
     try { await chrome.debugger.detach({ tabId: proxyTabId }); } catch {}
     proxyTabId = null;
   }
-
-  await closeWsProxy();
 
   activeConfig = null;
   isConnected = false;
