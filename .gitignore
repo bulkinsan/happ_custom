@@ -12,3 +12,6 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Node.js
+native-host/node_modules/
