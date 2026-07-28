@@ -1,0 +1,8 @@
+{
+  "name": "happ-vpn-proxy",
+  "description": "Happ VPN local proxy",
+  "path": "node",
+  "args": ["proxy.js"],
+  "type": "stdio",
+  "allowed_origins": []
+}

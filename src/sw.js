@@ -2,6 +2,8 @@ let activeConfig = null;
 let isConnected = false;
 let serverList = [];
 let connecting = false;
+let nativePort = null;
+let proxyPort = 18080;
 
 function uuidToBytes(uuid) {
   const hex = uuid.replace(/-/g, '');
@@ -29,23 +31,6 @@ function parseVlessUrl(urlStr) {
       name
     };
   } catch { return null; }
-}
-
-function buildVlessHandshake(config, host, port) {
-  const uuidBytes = uuidToBytes(config.uuid);
-  const encoder = new TextEncoder();
-  const hostBytes = encoder.encode(host);
-  const packet = new Uint8Array(1 + 16 + 2 + 1 + 2 + 1 + 1 + hostBytes.length);
-  let off = 0;
-  packet[off++] = 0x00;
-  packet.set(uuidBytes, off); off += 16;
-  packet[off++] = 0x00; packet[off++] = 0x00;
-  packet[off++] = 0x01;
-  packet[off++] = (port >> 8) & 0xFF; packet[off++] = port & 0xFF;
-  packet[off++] = 0x02;
-  packet[off++] = hostBytes.length;
-  packet.set(hostBytes, off);
-  return packet;
 }
 
 async function getSubUrl() {
@@ -79,7 +64,7 @@ async function fetchSubscription() {
   const resp = await fetchWithRetry(subUrl);
   if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
   const text = (await resp.text()).trim();
-  console.log('Response OK, length:', text.length, 'starts with:', text.slice(0, 30));
+  console.log('Response OK, length:', text.length);
   let decoded;
   if (text.startsWith('vless://') || text.includes('\nvless://')) {
     decoded = text;
@@ -103,28 +88,10 @@ async function loadServers() {
     await chrome.storage.local.set({ servers: serverList });
   } catch (e) {
     console.error('Failed to fetch subscription:', e.message || e);
-    console.error('Stack:', e.stack);
     const cached = await chrome.storage.local.get('servers');
     serverList = cached.servers || [];
   }
   return serverList;
-}
-
-async function addHostHeaderRules(serverList) {
-  try {
-    // Remove all existing host header rules first
-    const existing = await chrome.declarativeNetRequest.getDynamicRules();
-    const toRemove = existing.map(r => r.id).filter(id => id !== 1);
-    const rules = serverList.map((s, i) => ({
-      id: 100 + i, priority: 1,
-      action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: s.host + ':' + s.port }] },
-      condition: { urlFilter: `||${s.server}` }
-    }));
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: toRemove,
-      addRules: rules
-    });
-  } catch (e) { console.error('DNR add rules failed:', e); }
 }
 
 async function addSubFetchRule(subUrl) {
@@ -146,20 +113,6 @@ async function addSubFetchRule(subUrl) {
   } catch (e) { console.error('DNR add fetch rule failed:', e); }
 }
 
-async function addHostHeaderRule(server, host, port) {
-  try {
-    await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: [2],
-      addRules: [{
-        id: 2, priority: 1,
-        action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: host + ':' + port }] },
-        condition: { urlFilter: `||${server}` }
-      }]
-    });
-  } catch (e) { console.error('DNR add rule failed:', e); }
-  console.log('DNR rule set: Host ->', host + ':' + port);
-}
-
 async function clearDynamicRules() {
   try {
     const existing = await chrome.declarativeNetRequest.getDynamicRules();
@@ -168,177 +121,135 @@ async function clearDynamicRules() {
   } catch {}
 }
 
-let proxyTabId = null;
+function sendNativeMessage(msg) {
+  return new Promise((resolve, reject) => {
+    if (!nativePort) return reject(new Error('No native connection'));
+    const callback = (response) => {
+      chrome.runtime.onMessage.removeListener(callback);
+      resolve(response);
+    };
+    nativePort.postMessage(msg);
+    setTimeout(() => reject(new Error('Native response timeout')), 15000);
+  });
+}
 
-function injectWsProxy(tabId) {
-  return chrome.scripting.executeScript({
-    target: { tabId },
-    func: () => {
-      const pending = {};
-      chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-        if (msg.type === 'WS_CREATE') {
-          const ws = new WebSocket(msg.url);
-          ws.onopen = () => { chrome.runtime.sendMessage({ type: 'WS_OPEN', reqId: msg.reqId }); sendResponse({ ok: true }); };
-          ws.onmessage = async (e) => {
-            const buf = await e.data.arrayBuffer();
-            chrome.runtime.sendMessage({ type: 'WS_DATA', reqId: msg.reqId, data: Array.from(new Uint8Array(buf)) });
-          };
-          ws.onerror = () => chrome.runtime.sendMessage({ type: 'WS_ERR', reqId: msg.reqId });
-          pending[msg.reqId] = ws;
-          return true;
-        }
-        if (msg.type === 'WS_SEND') {
-          const ws = pending[msg.reqId];
-          if (ws && ws.readyState === WebSocket.OPEN) { ws.send(new Uint8Array(msg.data)); sendResponse({ ok: true }); }
-          else sendResponse({ ok: false });
-        }
-      });
-    }
-  }).catch(e => console.error('injectWsProxy failed:', e));
+async function startNativeProxy(config) {
+  return new Promise((resolve, reject) => {
+    nativePort = chrome.runtime.connectNative('happ-vpn-proxy');
+
+    nativePort.onDisconnect.addListener(() => {
+      const err = chrome.runtime.lastError;
+      console.error('Native host disconnected:', err?.message || 'unknown');
+      nativePort = null;
+      if (isConnected) {
+        stopProxy();
+      }
+    });
+
+    nativePort.onMessage.addListener((msg) => {
+      console.log('Native message:', msg);
+      if (msg.success && msg.port) {
+        proxyPort = msg.port;
+        resolve(msg.port);
+      } else if (msg.error) {
+        reject(new Error(msg.error));
+      }
+    });
+
+    nativePort.postMessage({ action: 'start', config });
+
+    setTimeout(() => {
+      if (!nativePort) reject(new Error('Native host connection timeout'));
+    }, 5000);
+  });
+}
+
+async function stopNativeProxy() {
+  if (nativePort) {
+    try {
+      nativePort.postMessage({ action: 'stop' });
+    } catch {}
+    try {
+      nativePort.disconnect();
+    } catch {}
+    nativePort = null;
+  }
+}
+
+async function enableProxy() {
+  return chrome.proxy.settings.set({
+    value: {
+      mode: 'fixed_servers',
+      rules: { singleProxy: { scheme: 'http', host: '127.0.0.1', port: proxyPort } }
+    },
+    scope: 'regular'
+  });
+}
+
+async function disableProxy() {
+  return chrome.proxy.settings.clear({ scope: 'regular' });
 }
 
 async function pingServer(config) {
   try {
-    const proto = config.security === 'tls' ? 'wss' : 'ws';
-    const url = `${proto}://${config.server}:${config.port}${config.path}`;
     const start = Date.now();
-    const ws = new WebSocket(url);
-    await new Promise((resolve, reject) => {
-      ws.onopen = () => { ws.close(); resolve(); };
-      ws.onerror = () => reject(new Error('WS error'));
-      setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 5000);
-    });
-    return Date.now() - start;
+    const resp = await fetch(`http://127.0.0.1:${proxyPort}/ping`, {
+      method: 'HEAD',
+      signal: AbortSignal.timeout(5000)
+    }).catch(() => null);
+    if (resp) return Date.now() - start;
+    return -1;
   } catch {
     return -1;
   }
 }
 
-async function proxyHttpRequest(config, method, host, port, path, headers, body) {
-  const proto = config.security === 'tls' ? 'wss' : 'ws';
-  const url = `${proto}://${config.server}:${config.port}${config.path}`;
-  const reqId = Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-  const tabId = proxyTabId;
-  if (!tabId) throw new Error('No tab for proxy');
+async function connectToServer(serverName) {
+  if (connecting) throw new Error('Already connecting');
+  connecting = true;
+  console.log('connectToServer called with:', serverName);
 
-  const openPromise = new Promise((resolve, reject) => {
-    const handler = (msg) => {
-      if (msg.type === 'WS_OPEN' && msg.reqId === reqId) { chrome.runtime.onMessage.removeListener(handler); resolve(); }
-      if (msg.type === 'WS_ERR' && msg.reqId === reqId) { chrome.runtime.onMessage.removeListener(handler); reject(new Error('WS connect failed')); }
-    };
-    chrome.runtime.onMessage.addListener(handler);
-    setTimeout(() => { chrome.runtime.onMessage.removeListener(handler); reject(new Error('WS timeout')); }, 10000);
-  });
-
-  const respPromise = new Promise((resolve, reject) => {
-    const chunks = [];
-    const handler = async (msg) => {
-      if (msg.type === 'WS_DATA' && msg.reqId === reqId) {
-        const bytes = new Uint8Array(msg.data);
-        chunks.push(bytes);
-        const fullResp = concatU8(chunks);
-        const hEnd = indexOf(fullResp, new Uint8Array([13, 10, 13, 10]));
-        if (hEnd === -1) return;
-
-        const headerStr = new TextDecoder().decode(fullResp.slice(0, hEnd));
-        const lines = headerStr.split('\r\n');
-        const code = parseInt(lines[0].split(' ')[1]) || 200;
-        const respHeaders = {};
-        let isChunked = false;
-        let cl = -1;
-        for (let i = 1; i < lines.length; i++) {
-          const ci = lines[i].indexOf(':');
-          if (ci > 0) {
-            const k = lines[i].slice(0, ci).trim().toLowerCase();
-            const v = lines[i].slice(ci + 1).trim();
-            respHeaders[k] = v;
-            if (k === 'content-length') cl = parseInt(v);
-            if (k === 'transfer-encoding' && v.includes('chunked')) isChunked = true;
-          }
-        }
-
-        const bodyStart = hEnd + 4;
-        let bodyData;
-        if (isChunked) {
-          bodyData = decodeChunked(fullResp.slice(bodyStart));
-          delete respHeaders['transfer-encoding'];
-        } else if (cl >= 0 && fullResp.length >= bodyStart + cl) {
-          bodyData = fullResp.slice(bodyStart, bodyStart + cl);
-        } else if (cl >= 0) {
-          return;
-        } else {
-          bodyData = fullResp.slice(bodyStart);
-        }
-
-        chrome.runtime.onMessage.removeListener(handler);
-        resolve(new Response(bodyData, {
-          status: code,
-          statusText: lines[0].split(' ').slice(2).join(' ') || 'OK',
-          headers: Object.entries(respHeaders)
-        }));
-      }
-    };
-    chrome.runtime.onMessage.addListener(handler);
-    setTimeout(() => { chrome.runtime.onMessage.removeListener(handler); resolve(new Response(concatU8(chunks), { status: 200 })); }, 30000);
-  });
-
-  await chrome.tabs.sendMessage(tabId, { type: 'WS_CREATE', url, reqId });
-  await openPromise;
-
-  const handshake = buildVlessHandshake(config, host, port);
-  await chrome.tabs.sendMessage(tabId, { type: 'WS_SEND', reqId, data: Array.from(handshake) });
-
-  let req = `${method} ${path} HTTP/1.1\r\nHost: ${host}${port !== 80 && port !== 443 ? ':' + port : ''}\r\n`;
-  for (const [k, v] of headers) {
-    if (k.toLowerCase() !== 'host') req += `${k}: ${v}\r\n`;
+  let config;
+  if (!serverName || serverName === 'auto') {
+    config = serverList[0];
+    if (!config) throw new Error('No servers available');
+  } else {
+    config = serverList.find(s => s.name === serverName);
+    if (!config) throw new Error('Server not found: ' + serverName);
   }
-  req += '\r\n';
-  const encoder = new TextEncoder();
-  const reqBytes = encoder.encode(req);
-  let bodyBytes = new Uint8Array(0);
-  if (body) {
-    if (typeof body === 'string') bodyBytes = encoder.encode(body);
-    else if (body instanceof ArrayBuffer) bodyBytes = new Uint8Array(body);
-  }
-  const full = new Uint8Array(reqBytes.length + bodyBytes.length);
-  full.set(reqBytes, 0);
-  full.set(bodyBytes, reqBytes.length);
-  await chrome.tabs.sendMessage(tabId, { type: 'WS_SEND', reqId, data: Array.from(full) });
 
-  return await respPromise;
+  try {
+    await startNativeProxy(config);
+    await enableProxy();
+
+    activeConfig = config;
+    isConnected = true;
+    const stats = await getStats();
+    stats.sessionStart = Date.now();
+    stats.connectedServer = config.name;
+    await saveStats(stats);
+    await chrome.storage.local.set({ connected: true, activeServer: config });
+
+    connecting = false;
+    return config.name;
+  } catch (e) {
+    connecting = false;
+    await stopNativeProxy().catch(() => {});
+    throw e;
+  }
 }
 
-function concatU8(chunks) {
-  const total = chunks.reduce((s, c) => s + c.length, 0);
-  const r = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) { r.set(c, off); off += c.length; }
-  return r;
-}
+async function disconnect() {
+  await disableProxy().catch(() => {});
+  await stopNativeProxy();
 
-function indexOf(data, pattern) {
-  for (let i = 0; i <= data.length - pattern.length; i++) {
-    let match = true;
-    for (let j = 0; j < pattern.length; j++) { if (data[i + j] !== pattern[j]) { match = false; break; } }
-    if (match) return i;
-  }
-  return -1;
-}
-
-function decodeChunked(data) {
-  const chunks = [];
-  let off = 0;
-  while (off < data.length) {
-    let sizeStr = '';
-    while (off < data.length && data[off] !== 13) { sizeStr += String.fromCharCode(data[off++]); }
-    if (off >= data.length) break;
-    off += 2;
-    const size = parseInt(sizeStr, 16);
-    if (size === 0) break;
-    chunks.push(data.slice(off, off + size));
-    off += size + 2;
-  }
-  return concatU8(chunks);
+  activeConfig = null;
+  isConnected = false;
+  const stats = await getStats();
+  stats.sessionStart = null;
+  stats.connectedServer = null;
+  await saveStats(stats);
+  await chrome.storage.local.set({ connected: false, activeServer: null });
 }
 
 function arrayBufferToBase64(buffer) {
@@ -358,153 +269,6 @@ async function saveStats(stats) {
   await chrome.storage.local.set({ happ_stats: stats });
 }
 
-async function connectToServer(serverName) {
-  if (connecting) throw new Error('Already connecting');
-  connecting = true;
-  console.log('connectToServer called with:', serverName);
-  let config;
-  if (!serverName || serverName === 'auto') {
-    let best = null;
-    for (const s of serverList) {
-      const ping = await pingServer(s);
-      if (ping > 0 && (!best || ping < best.ping)) best = { s, ping };
-    }
-    if (!best) throw new Error('No reachable servers');
-    config = best.s;
-  } else {
-    config = serverList.find(s => s.name === serverName);
-    if (!config) throw new Error('Server not found');
-  }
-
-  activeConfig = config;
-  isConnected = true;
-  const stats = await getStats();
-  stats.sessionStart = Date.now();
-  stats.connectedServer = config.name;
-  await saveStats(stats);
-  await chrome.storage.local.set({ connected: true, activeServer: config });
-
-  await clearDynamicRules();
-  await addSubFetchRule(await getSubUrl());
-  await addHostHeaderRule(config.server, config.host, config.port);
-
-  const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  let tab = tabs?.[0];
-  if (!tab || !tab.url || tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
-    const all = await chrome.tabs.query({ url: ['http://*/*', 'https://*/*'] });
-    tab = all?.[0];
-  }
-  if (tab && tab.id && tab.url && !tab.url.startsWith('chrome://') && !tab.url.startsWith('chrome-extension://')) {
-    try {
-      proxyTabId = tab.id;
-      await injectWsProxy(tab.id);
-      await chrome.debugger.attach({ tabId: tab.id }, '1.3');
-      await chrome.debugger.sendCommand({ tabId: tab.id }, 'Fetch.enable', {
-        patterns: [
-          { urlPattern: 'http://*/*', requestStage: 'request' }
-        ]
-      });
-      console.log('Debugger + content script ready on tab', tab.id);
-    } catch (e) {
-      console.error('Debugger attach failed:', e);
-    }
-  } else {
-    console.error('No suitable tab for proxy.');
-  }
-
-  chrome.debugger.onEvent.removeListener(onDebuggerEvent);
-  chrome.debugger.onEvent.addListener(onDebuggerEvent);
-  chrome.debugger.onDetach.removeListener(onDebuggerDetach);
-  chrome.debugger.onDetach.addListener(onDebuggerDetach);
-
-  connecting = false;
-  return config.name;
-}
-
-async function disconnect() {
-  await clearDynamicRules();
-  await addSubFetchRule(await getSubUrl());
-  chrome.debugger.onEvent.removeListener(onDebuggerEvent);
-  chrome.debugger.onDetach.removeListener(onDebuggerDetach);
-
-  if (proxyTabId) {
-    try { await chrome.debugger.detach({ tabId: proxyTabId }); } catch {}
-    proxyTabId = null;
-  }
-
-  activeConfig = null;
-  isConnected = false;
-  const stats = await getStats();
-  stats.sessionStart = null;
-  stats.connectedServer = null;
-  await saveStats(stats);
-  await chrome.storage.local.set({ connected: false, activeServer: null });
-}
-
-function onDebuggerDetach(source) {
-  if (!isConnected || !source.tabId) return;
-  console.warn('Debugger detached from tab', source.tabId);
-  setTimeout(async () => {
-    try {
-      proxyTabId = source.tabId;
-      await injectWsProxy(source.tabId);
-      await chrome.debugger.attach({ tabId: source.tabId }, '1.3');
-      await chrome.debugger.sendCommand({ tabId: source.tabId }, 'Fetch.enable', {
-        patterns: [
-          { urlPattern: 'http://*/*', requestStage: 'request' }
-        ]
-      });
-      console.log('Debugger re-attached + content script on tab', source.tabId);
-    } catch (e) {
-      console.error('Re-attach failed:', e);
-    }
-  }, 1000);
-}
-
-async function onDebuggerEvent(source, method, params) {
-  if (method !== 'Fetch.requestPaused') return;
-  const { requestId, request } = params;
-  const url = request.url;
-
-  try {
-    if (url.startsWith('http://') && activeConfig) {
-      const parsed = new URL(url);
-      const hdrs = Array.isArray(request.headers) ? request.headers.map(h => [h.name, h.value]) : Object.entries(request.headers || {});
-      const resp = await proxyHttpRequest(activeConfig, request.method, parsed.hostname, parsed.port || 80, parsed.pathname + parsed.search, hdrs, request.postData || null);
-      const body = await resp.arrayBuffer();
-      const b64 = arrayBufferToBase64(body);
-      const respHeaders = [];
-      resp.headers.forEach((v, k) => respHeaders.push({ name: k, value: v }));
-
-      await chrome.debugger.sendCommand(
-        { tabId: source.tabId, sessionId: source.sessionId },
-        'Fetch.fulfillRequest',
-        { requestId, responseCode: resp.status, responseHeaders: respHeaders, body: b64 }
-      );
-
-      const stats = await getStats();
-      stats.rx += body.byteLength;
-      stats.tx += (request.postData?.length || 0);
-      await saveStats(stats);
-    } else {
-      await chrome.debugger.sendCommand(
-        { tabId: source.tabId, sessionId: source.sessionId },
-        'Fetch.continueRequest',
-        { requestId }
-      );
-    }
-  } catch (e) {
-    console.error('onDebuggerEvent error:', e);
-    try {
-      await chrome.debugger.sendCommand(
-        { tabId: source.tabId, sessionId: source.sessionId },
-        'Fetch.continueRequest',
-        { requestId }
-      );
-    } catch {}
-  }
-}
-
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   switch (msg.type) {
     case 'LOAD_SERVERS':
@@ -519,20 +283,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       (async () => {
         const results = [];
         for (const s of serverList) {
-          const p = await pingServer(s);
-          results.push({ name: s.name, ping: p });
-          if (serverList.length > 5) await new Promise(r => setTimeout(r, 100));
+          results.push({ name: s.name, ping: -1 });
         }
         sendResponse({ results });
       })();
       return true;
 
     case 'CONNECT':
-      connectToServer(msg.serverName).then(n => sendResponse({ success: true, serverName: n })).catch(e => sendResponse({ success: false, error: e.message }));
+      connectToServer(msg.serverName)
+        .then(n => sendResponse({ success: true, serverName: n }))
+        .catch(e => sendResponse({ success: false, error: e.message }));
       return true;
 
     case 'DISCONNECT':
-      disconnect().then(() => sendResponse({ success: true })).catch(e => sendResponse({ success: false, error: e.message }));
+      disconnect()
+        .then(() => sendResponse({ success: true }))
+        .catch(e => sendResponse({ success: false, error: e.message }));
       return true;
 
     case 'GET_STATUS':

@@ -1,0 +1,9 @@
+{
+  "name": "happ-vpn-proxy",
+  "version": "1.0.0",
+  "description": "Happ VPN local proxy via native messaging",
+  "main": "proxy.js",
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
