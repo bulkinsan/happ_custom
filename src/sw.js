@@ -475,10 +475,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     case 'PING_ALL':
       (async () => {
         const results = [];
+        const rules = serverList.map((s, i) => ({
+          id: 100 + i, priority: 1,
+          action: { type: 'modifyHeaders', requestHeaders: [{ header: 'Host', operation: 'set', value: s.host }] },
+          condition: { urlFilter: `||${s.server}`, resourceTypes: ['websocket'] }
+        }));
+        if (rules.length) await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: rules.map(r => r.id), addRules: rules });
         for (const s of serverList) {
           const ping = await pingServer(s);
           results.push({ name: s.name, ping });
         }
+        if (rules.length) await chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: rules.map(r => r.id) });
         sendResponse({ results });
       })();
       return true;
