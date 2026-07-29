@@ -123,7 +123,7 @@ async function clearDynamicRules() {
 async function startNativeProxy(config) {
   try {
     console.log('Sending native message...');
-    const resp = await chrome.runtime.sendNativeMessage('happ-vpn-proxy', { action: 'start', config });
+    const resp = await chrome.runtime.sendNativeMessage('happ_vpn_proxy', { action: 'start', config });
     console.log('Native response:', resp);
     if (resp && resp.success) {
       proxyPort = resp.port;
@@ -138,7 +138,7 @@ async function startNativeProxy(config) {
 
 async function stopNativeProxy() {
   try {
-    await chrome.runtime.sendNativeMessage('happ-vpn-proxy', { action: 'stop' });
+    await chrome.runtime.sendNativeMessage('happ_vpn_proxy', { action: 'stop' });
   } catch {}
 }
 

@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayexpansion
 
-set HOST_NAME=happ-vpn-proxy
+set HOST_NAME=happ_vpn_proxy
 set HOST_DIR=%~dp0
 
 pushd "%HOST_DIR%"
@@ -29,8 +29,7 @@ echo Creating manifest...
     echo {
     echo   "name": "%HOST_NAME%",
     echo   "description": "Happ VPN local proxy",
-    echo   "path": "!NODE_PATH!",
-    echo   "args": ["%HOST_DIR%proxy.js"],
+    echo   "path": "%HOST_DIR%%HOST_NAME%.bat",
     echo   "type": "stdio",
     echo   "allowed_origins": []
     echo }
