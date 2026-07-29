@@ -1,19 +1,18 @@
-const http = require('http');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 
 function log(...args) { const s = args.join(' ') + '\n'; process.stderr.write(s); }
 
-const PID_FILE = path.join(__dirname, 'proxy.pid');
 const CONFIG_FILE = path.join(__dirname, 'proxy-config.json');
 const PORT = 18080;
 
 let config = null;
 try {
   config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-  log('Daemon config:', JSON.stringify(config));
+  log('Config loaded');
 } catch (e) {
-  log('No config file, exiting:', e.message);
+  log('No config:', e.message);
   process.exit(1);
 }
 
@@ -45,58 +44,98 @@ function connectVless(targetHost, targetPort) {
   return new Promise((resolve, reject) => {
     const proto = config.security === 'tls' ? 'wss' : 'ws';
     const url = `${proto}://${config.server}:${config.port}${config.path}`;
-    log('WS connect to:', url, 'Host:', config.host + ':' + config.port);
+    log('WS', url, 'Host:', config.host + ':' + config.port, 'target:', targetHost + ':' + targetPort);
     const ws = new WebSocket(url, {
       headers: { Host: config.host + ':' + config.port }
     });
     ws.on('open', () => {
-      log('WS open, sending handshake for', targetHost + ':' + targetPort);
+      log('WS open for', targetHost + ':' + targetPort);
       const handshake = buildVlessHandshake(config.uuid, targetHost, targetPort);
       ws.send(handshake);
       resolve(ws);
     });
-    ws.on('error', (err) => {
-      log('WS error:', err.message);
-      reject(err);
-    });
-    const t = setTimeout(() => {
-      log('WS timeout after 10s');
-      reject(new Error('WS timeout'));
-    }, 10000);
+    ws.on('error', (err) => { log('WS error:', err.message); reject(err); });
+    const t = setTimeout(() => { log('WS timeout'); reject(new Error('WS timeout')); }, 10000);
     ws.on('open', () => clearTimeout(t));
   });
 }
 
-function handleConnect(req, clientSocket, head) {
-  const [host, port] = req.url.split(':');
-  const targetPort = parseInt(port) || 80;
-  log('CONNECT', req.url, '->', host + ':' + targetPort);
-
-  connectVless(host, targetPort).then((ws) => {
-    log('VLESS connected for', host + ':' + targetPort);
-    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-    if (head.length > 0) ws.send(head);
-    clientSocket.on('data', (data) => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
-    ws.on('message', (data) => { if (!clientSocket.destroyed) clientSocket.write(data); });
-    ws.on('close', () => { if (!clientSocket.destroyed) clientSocket.end(); });
-    clientSocket.on('close', () => { try { ws.close(); } catch {} });
-    clientSocket.on('error', () => { try { ws.close(); } catch {} });
-    ws.on('error', () => { if (!clientSocket.destroyed) clientSocket.destroy(); });
-  }).catch((err) => {
-    log('Connect failed:', err.message, 'for', host + ':' + targetPort);
-    clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
-    clientSocket.end();
-  });
+function tunnel(ws, clientSocket, firstChunk) {
+  clientSocket.on('data', (data) => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
+  ws.on('message', (data) => { if (!clientSocket.destroyed) clientSocket.write(data); });
+  ws.on('close', () => { try { clientSocket.end(); } catch {} });
+  clientSocket.on('close', () => { try { ws.close(); } catch {} });
+  clientSocket.on('error', () => { try { ws.close(); } catch {} });
+  ws.on('error', () => { try { clientSocket.destroy(); } catch {} });
+  if (firstChunk && firstChunk.length > 0) ws.send(firstChunk);
 }
 
-const server = http.createServer(handleConnect);
+const server = net.createServer((clientSocket) => {
+  let buf = Buffer.alloc(0);
+
+  clientSocket.once('data', (data) => {
+    buf = data;
+    const firstLine = buf.toString('utf8').split('\r\n')[0];
+
+    if (firstLine.startsWith('CONNECT ')) {
+      // HTTPS CONNECT request
+      const parts = firstLine.split(' ');
+      const addr = parts[1];
+      const [host, portStr] = addr.split(':');
+      const targetPort = parseInt(portStr) || 443;
+      log('CONNECT', addr);
+
+      connectVless(host, targetPort).then((ws) => {
+        log('Tunnel for', addr);
+        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        tunnel(ws, clientSocket, null);
+      }).catch((err) => {
+        log('CONNECT fail:', err.message, addr);
+        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        clientSocket.end();
+      });
+    } else {
+      // Regular HTTP request (GET, POST, etc.)
+      const urlMatch = firstLine.match(/^[A-Z]+\s+(https?:\/\/[^\s]+)\s+HTTP/);
+      if (!urlMatch) {
+        log('Unknown request:', firstLine);
+        clientSocket.end();
+        return;
+      }
+      const fullUrl = urlMatch[1];
+      const urlObj = new URL(fullUrl);
+      const host = urlObj.hostname;
+      const targetPort = parseInt(urlObj.port) || 80;
+      log('HTTP', firstLine, '->', host + ':' + targetPort);
+
+      connectVless(host, targetPort).then((ws) => {
+        log('HTTP tunnel for', host + ':' + targetPort);
+        // Rewrite request: replace absolute URL with relative path
+        const verb = firstLine.split(' ')[0];
+        const relativePath = urlObj.pathname + urlObj.search;
+        let modified = buf.toString('utf8').replace(fullUrl, relativePath);
+        // Remove Proxy-* headers
+        modified = modified.replace(/^Proxy-.*\r\n/gmi, '');
+        // Change Host header if present
+        modified = modified.replace(/^Host: .*\r\n/im, 'Host: ' + host + ':' + targetPort + '\r\n');
+        const wsBuf = Buffer.from(modified, 'utf8');
+        tunnel(ws, clientSocket, wsBuf);
+      }).catch((err) => {
+        log('HTTP fail:', err.message, host + ':' + targetPort);
+        clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
+        clientSocket.end();
+      });
+    }
+  });
+});
+
 server.listen(PORT, '127.0.0.1', () => {
-  log('Daemon proxy listening on 127.0.0.1:' + PORT);
+  log('Proxy on 127.0.0.1:' + PORT);
 });
 
 function cleanup() {
-  log('Daemon shutting down');
-  try { fs.unlinkSync(PID_FILE); } catch {}
+  log('Shutdown');
+  try { fs.unlinkSync(path.join(__dirname, 'proxy.pid')); } catch {}
   try { fs.unlinkSync(CONFIG_FILE); } catch {}
   process.exit(0);
 }
