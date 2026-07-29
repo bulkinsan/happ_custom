@@ -51,9 +51,10 @@ function getRunningPid() {
 
 function startDaemon(config) {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config));
+  const logFile = fs.openSync(path.join(__dirname, 'daemon.log'), 'a');
   const child = spawn(process.execPath, [DAEMON_JS], {
     detached: true,
-    stdio: ['ignore', 'ignore', 'ignore']
+    stdio: ['ignore', logFile, logFile]
   });
   child.unref();
   fs.writeFileSync(PID_FILE, String(child.pid));

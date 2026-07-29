@@ -25,8 +25,9 @@ async function loadServers() {
   const resp = await chrome.runtime.sendMessage({ type: 'LOAD_SERVERS' });
   state.servers = resp?.servers || [];
 
-  const conn = await chrome.storage.local.get('connected');
+  const conn = await chrome.storage.local.get(['connected', 'activeServer']);
   state.connected = conn.connected || false;
+  state.activeServer = conn.activeServer?.name || null;
 
   renderServerList();
   updateConnectionUI();

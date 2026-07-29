@@ -2,7 +2,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-function log(...args) { process.stderr.write(args.join(' ') + '\n'); }
+function log(...args) { const s = args.join(' ') + '\n'; process.stderr.write(s); }
 
 const PID_FILE = path.join(__dirname, 'proxy.pid');
 const CONFIG_FILE = path.join(__dirname, 'proxy-config.json');
@@ -11,8 +11,9 @@ const PORT = 18080;
 let config = null;
 try {
   config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
-} catch {
-  log('No config file, exiting');
+  log('Daemon config:', JSON.stringify(config));
+} catch (e) {
+  log('No config file, exiting:', e.message);
   process.exit(1);
 }
 
@@ -44,24 +45,35 @@ function connectVless(targetHost, targetPort) {
   return new Promise((resolve, reject) => {
     const proto = config.security === 'tls' ? 'wss' : 'ws';
     const url = `${proto}://${config.server}:${config.port}${config.path}`;
+    log('WS connect to:', url, 'Host:', config.host + ':' + config.port);
     const ws = new WebSocket(url, {
       headers: { Host: config.host + ':' + config.port }
     });
     ws.on('open', () => {
+      log('WS open, sending handshake for', targetHost + ':' + targetPort);
       const handshake = buildVlessHandshake(config.uuid, targetHost, targetPort);
       ws.send(handshake);
       resolve(ws);
     });
-    ws.on('error', reject);
-    setTimeout(() => reject(new Error('WS timeout')), 10000);
+    ws.on('error', (err) => {
+      log('WS error:', err.message);
+      reject(err);
+    });
+    const t = setTimeout(() => {
+      log('WS timeout after 10s');
+      reject(new Error('WS timeout'));
+    }, 10000);
+    ws.on('open', () => clearTimeout(t));
   });
 }
 
 function handleConnect(req, clientSocket, head) {
   const [host, port] = req.url.split(':');
   const targetPort = parseInt(port) || 80;
+  log('CONNECT', req.url, '->', host + ':' + targetPort);
 
   connectVless(host, targetPort).then((ws) => {
+    log('VLESS connected for', host + ':' + targetPort);
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
     if (head.length > 0) ws.send(head);
     clientSocket.on('data', (data) => { if (ws.readyState === WebSocket.OPEN) ws.send(data); });
@@ -71,7 +83,7 @@ function handleConnect(req, clientSocket, head) {
     clientSocket.on('error', () => { try { ws.close(); } catch {} });
     ws.on('error', () => { if (!clientSocket.destroyed) clientSocket.destroy(); });
   }).catch((err) => {
-    log('Connect failed:', err.message);
+    log('Connect failed:', err.message, 'for', host + ':' + targetPort);
     clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
     clientSocket.end();
   });

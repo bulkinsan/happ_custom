@@ -82,6 +82,11 @@ async function fetchSubscription() {
 }
 
 async function loadServers() {
+  if (isConnected) {
+    const cached = await chrome.storage.local.get('servers');
+    serverList = cached.servers || [];
+    return serverList;
+  }
   try {
     serverList = await fetchSubscription();
     await chrome.storage.local.set({ servers: serverList });

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Happ Custom VPN",
-  "version": "1.0.40",
+  "version": "1.0.41",
   "description": "VPN extension for Happ VPN with VLESS protocol support",
   "permissions": [
     "storage",
