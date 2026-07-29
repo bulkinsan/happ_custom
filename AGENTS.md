@@ -11,7 +11,8 @@ happ_castom_v1/
 ├── manifest.json              # Manifest v3, version, permissions
 ├── src/sw.js                  # Service Worker: proxy engine, subscription
 ├── native-host/               # Native messaging host (Node.js)
-│   ├── proxy.js               # Local HTTP proxy + VLESS WebSocket client
+│   ├── proxy.js               # Native host entry (handles start/stop/status messages)
+│   ├── daemon.js              # Background proxy daemon (HTTP CONNECT + VLESS WS)
 │   ├── package.json           # Node.js dependencies
 │   ├── install.bat            # Windows installer (registers with Chrome)
 │   └── happ-vpn-proxy.json   # Native host manifest (auto-generated)
@@ -70,8 +71,9 @@ Browser HTTP/HTTPS request
 
 ### Key Components
 
-- **Native host** (`proxy.js`): Node.js HTTP CONNECT proxy that creates WebSocket to VLESS server with correct Host header
-- **Service Worker** (`sw.js`): Manages subscription, server list, connects/disconnects native host, controls chrome.proxy
+- **Native host** (`proxy.js`): Handles `sendNativeMessage` calls from Chrome (start/stop/status), spawns daemon
+- **Daemon** (`daemon.js`): Background HTTP CONNECT proxy, creates WebSocket to VLESS server with correct Host header
+- **Service Worker** (`sw.js`): Manages subscription, server list, sends native messages, controls chrome.proxy
 - **DNR rule**: User-Agent override for subscription fetch
 
 ### Permissions Required
@@ -85,6 +87,10 @@ Browser HTTP/HTTPS request
 ### Why Native Host?
 
 Chrome MV3 does not allow setting custom HTTP headers on WebSocket connections from Service Worker or content scripts. The VLESS server requires a specific `Host` header in the WebSocket upgrade request. A native host (Node.js) can set any headers, solving this limitation.
+
+### Why sendNativeMessage?
+
+Chrome MV3 service workers cannot use `chrome.runtime.connectNative()` for persistent native messaging connections (gives "Invalid native messaging host name specified" error). Instead, we use `chrome.runtime.sendNativeMessage()` for one-shot messages. The native host (`proxy.js`) spawns a background daemon process that persists after the native messaging connection closes.
 
 ## Git Workflow
 

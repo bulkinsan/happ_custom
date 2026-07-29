@@ -46,6 +46,13 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
+REM Copy daemon.js to deployment dir
+if not exist "%HOST_DIR%daemon.js" (
+    echo daemon.js not found in %HOST_DIR%
+    pause
+    exit /b 1
+)
+
 REM Install ws dependency
 if not exist "%HOST_DIR%node_modules" (
     echo Installing dependencies...

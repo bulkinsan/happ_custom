@@ -2,7 +2,6 @@ let activeConfig = null;
 let isConnected = false;
 let serverList = [];
 let connecting = false;
-let nativePort = null;
 let proxyPort = 18080;
 
 function uuidToBytes(uuid) {
@@ -121,59 +120,26 @@ async function clearDynamicRules() {
   } catch {}
 }
 
-function sendNativeMessage(msg) {
-  return new Promise((resolve, reject) => {
-    if (!nativePort) return reject(new Error('No native connection'));
-    const callback = (response) => {
-      chrome.runtime.onMessage.removeListener(callback);
-      resolve(response);
-    };
-    nativePort.postMessage(msg);
-    setTimeout(() => reject(new Error('Native response timeout')), 15000);
-  });
-}
-
 async function startNativeProxy(config) {
-  return new Promise((resolve, reject) => {
-    nativePort = chrome.runtime.connectNative('happ-vpn-proxy');
-
-    nativePort.onDisconnect.addListener(() => {
-      const err = chrome.runtime.lastError;
-      console.error('Native host disconnected:', err?.message || 'unknown');
-      nativePort = null;
-      if (isConnected) {
-        stopProxy();
-      }
-    });
-
-    nativePort.onMessage.addListener((msg) => {
-      console.log('Native message:', msg);
-      if (msg.success && msg.port) {
-        proxyPort = msg.port;
-        resolve(msg.port);
-      } else if (msg.error) {
-        reject(new Error(msg.error));
-      }
-    });
-
-    nativePort.postMessage({ action: 'start', config });
-
-    setTimeout(() => {
-      if (!nativePort) reject(new Error('Native host connection timeout'));
-    }, 5000);
-  });
+  try {
+    console.log('Sending native message...');
+    const resp = await chrome.runtime.sendNativeMessage('happ-vpn-proxy', { action: 'start', config });
+    console.log('Native response:', resp);
+    if (resp && resp.success) {
+      proxyPort = resp.port;
+      return resp.port;
+    }
+    throw new Error(resp?.error || 'Native host returned failure');
+  } catch (e) {
+    console.error('Native host error:', e.message);
+    throw e;
+  }
 }
 
 async function stopNativeProxy() {
-  if (nativePort) {
-    try {
-      nativePort.postMessage({ action: 'stop' });
-    } catch {}
-    try {
-      nativePort.disconnect();
-    } catch {}
-    nativePort = null;
-  }
+  try {
+    await chrome.runtime.sendNativeMessage('happ-vpn-proxy', { action: 'stop' });
+  } catch {}
 }
 
 async function enableProxy() {
