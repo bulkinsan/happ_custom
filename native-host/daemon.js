@@ -26,11 +26,13 @@ function uuidToBytes(uuid) {
 function buildVlessHandshake(uuid, targetHost, targetPort) {
   const uuidBytes = uuidToBytes(uuid);
   const hostBytes = Buffer.from(targetHost, 'utf8');
-  const packet = Buffer.alloc(1 + 16 + 2 + 1 + 2 + 1 + 1 + hostBytes.length);
+  // Addon: type=0x0001 (BE), length=0x0000 → 4 bytes
+  const packet = Buffer.alloc(1 + 16 + 4 + 1 + 2 + 1 + 1 + hostBytes.length);
   let off = 0;
   packet[off++] = 0x00;
   uuidBytes.copy(packet, off); off += 16;
-  packet[off++] = 0x00; packet[off++] = 0x00;
+  packet[off++] = 0x00; packet[off++] = 0x01; // addon type = 0x0001 (BE)
+  packet[off++] = 0x00; packet[off++] = 0x00; // addon length = 0
   packet[off++] = 0x01;
   packet[off++] = (targetPort >> 8) & 0xFF; packet[off++] = targetPort & 0xFF;
   packet[off++] = 0x02;
