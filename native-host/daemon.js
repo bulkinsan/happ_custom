@@ -1,4 +1,5 @@
 const net = require('net');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
@@ -26,13 +27,12 @@ function uuidToBytes(uuid) {
 function buildVlessHandshake(uuid, targetHost, targetPort) {
   const uuidBytes = uuidToBytes(uuid);
   const hostBytes = Buffer.from(targetHost, 'utf8');
-  // Addon: type=0x0001 (BE), length=0x0000 → 4 bytes
   const packet = Buffer.alloc(1 + 16 + 4 + 1 + 2 + 1 + 1 + hostBytes.length);
   let off = 0;
   packet[off++] = 0x00;
   uuidBytes.copy(packet, off); off += 16;
-  packet[off++] = 0x00; packet[off++] = 0x01; // addon type = 0x0001 (BE)
-  packet[off++] = 0x00; packet[off++] = 0x00; // addon length = 0
+  packet[off++] = 0x00; packet[off++] = 0x01;
+  packet[off++] = 0x00; packet[off++] = 0x00;
   packet[off++] = 0x01;
   packet[off++] = (targetPort >> 8) & 0xFF; packet[off++] = targetPort & 0xFF;
   packet[off++] = 0x02;
@@ -46,31 +46,27 @@ function connectVless(targetHost, targetPort, firstPayload) {
   return new Promise((resolve, reject) => {
     const proto = config.security === 'tls' ? 'wss' : 'ws';
     const url = `${proto}://${config.server}:${config.port}${config.path}`;
-    log('WS', url, 'Host:', config.host + ':' + config.port, 'target:', targetHost + ':' + targetPort);
     const ws = new WebSocket(url, {
       headers: { Host: config.host + ':' + config.port },
       perMessageDeflate: false
     });
     ws.on('open', () => {
-      log('WS open for', targetHost + ':' + targetPort);
-      // Send handshake + first payload in a single WebSocket frame
       const handshake = buildVlessHandshake(config.uuid, targetHost, targetPort);
       if (firstPayload && firstPayload.length > 0) {
-        const combined = Buffer.concat([handshake, firstPayload]);
-        ws.send(combined);
+        ws.send(Buffer.concat([handshake, firstPayload]));
       } else {
         ws.send(handshake);
       }
       resolve(ws);
     });
-    ws.on('error', (err) => { log('WS error:', err.message); reject(err); });
-    const t = setTimeout(() => { log('WS timeout'); reject(new Error('WS timeout')); }, 10000);
+    ws.on('error', reject);
+    const t = setTimeout(() => reject(new Error('WS timeout')), 10000);
     ws.on('open', () => clearTimeout(t));
   });
 }
 
 function tunnel(ws, clientSocket, label) {
-  let sent = 0, recv = 0;
+  let sent = 0, recv = 0, hasVlessResp = false;
   clientSocket.on('data', (data) => {
     if (ws.readyState === WebSocket.OPEN) {
       sent += data.length;
@@ -78,11 +74,20 @@ function tunnel(ws, clientSocket, label) {
     }
   });
   ws.on('message', (data) => {
+    // Skip the first VLESS response (typically 2 bytes: 0x00 0x00)
+    if (!hasVlessResp && data.length <= 4) {
+      hasVlessResp = true;
+      log('VLESS resp for', label, ':', data.toString('hex'));
+      return;
+    }
     recv += data.length;
     if (!clientSocket.destroyed) clientSocket.write(data);
   });
-  ws.on('close', () => { log('WS closed', label, '- sent:', sent, 'recv:', recv); try { clientSocket.end(); } catch {} });
-  clientSocket.on('close', () => { log('Client closed', label, '- sent:', sent, 'recv:', recv); try { ws.close(); } catch {} });
+  ws.on('close', () => {
+    log('Closed', label, '- sent:', sent, 'recv:', recv);
+    if (!clientSocket.destroyed) clientSocket.end();
+  });
+  clientSocket.on('close', () => { try { ws.close(); } catch {} });
   clientSocket.on('error', () => { try { ws.close(); } catch {} });
   ws.on('error', () => { try { clientSocket.destroy(); } catch {} });
 }
@@ -92,50 +97,82 @@ const server = net.createServer((clientSocket) => {
     const firstLine = data.toString('utf8').split('\r\n')[0];
 
     if (firstLine.startsWith('CONNECT ')) {
+      // HTTPS via VLESS tunnel
       const parts = firstLine.split(' ');
       const addr = parts[1];
       const [host, portStr] = addr.split(':');
       const targetPort = parseInt(portStr) || 443;
       log('CONNECT', addr);
 
-      const ws = connectVless(host, targetPort, null);
-      ws.then((wsConn) => {
-        log('Tunnel for', addr);
+      connectVless(host, targetPort, null).then((ws) => {
         clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        tunnel(wsConn, clientSocket, addr);
+        tunnel(ws, clientSocket, addr);
       }).catch((err) => {
         log('CONNECT fail:', err.message, addr);
         clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
         clientSocket.end();
       });
     } else {
+      // HTTP direct (bypass VLESS - via Node.js http module)
       const urlMatch = firstLine.match(/^[A-Z]+\s+(https?:\/\/[^\s]+)\s+HTTP/);
       if (!urlMatch) {
-        log('Unknown request:', firstLine);
+        log('Unknown:', firstLine);
         clientSocket.end();
         return;
       }
       const fullUrl = urlMatch[1];
       const urlObj = new URL(fullUrl);
-      const host = urlObj.hostname;
-      const targetPort = parseInt(urlObj.port) || 80;
-      log('HTTP', firstLine, '->', host + ':' + targetPort);
-
-      // Rewrite request: replace absolute URL with relative path
-      const relativePath = urlObj.pathname + urlObj.search;
-      let modified = data.toString('utf8').replace(fullUrl, relativePath);
-      modified = modified.replace(/^Proxy-.*\r\n/gmi, '');
-      modified = modified.replace(/^Host: .*\r\n/im, 'Host: ' + host + ':' + targetPort + '\r\n');
-      const firstPayload = Buffer.from(modified, 'utf8');
-
-      connectVless(host, targetPort, firstPayload).then((wsConn) => {
-        log('HTTP tunnel for', host + ':' + targetPort);
-        tunnel(wsConn, clientSocket, host + ':' + targetPort);
-      }).catch((err) => {
-        log('HTTP fail:', err.message, host + ':' + targetPort);
+      log('HTTP', firstLine, '-> direct', urlObj.host);
+      
+      // Forward HTTP request directly
+      const options = {
+        hostname: urlObj.hostname,
+        port: parseInt(urlObj.port) || 80,
+        path: urlObj.pathname + urlObj.search,
+        method: firstLine.split(' ')[0],
+        headers: {}
+      };
+      
+      // Parse headers from original request
+      const headerLines = data.toString('utf8').split('\r\n');
+      for (let i = 1; i < headerLines.length; i++) {
+        const line = headerLines[i];
+        if (!line || line.startsWith('Proxy-')) continue;
+        const colonIdx = line.indexOf(':');
+        if (colonIdx > 0) {
+          const name = line.substring(0, colonIdx).trim();
+          const val = line.substring(colonIdx + 1).trim();
+          if (name.toLowerCase() !== 'host' && name.toLowerCase() !== 'proxy-connection') {
+            options.headers[name] = val;
+          }
+        }
+      }
+      options.headers['Host'] = urlObj.hostname;
+      options.headers['Connection'] = 'close';
+      
+      const proxyReq = http.request(options, (proxyRes) => {
+        const statusLine = `HTTP/1.1 ${proxyRes.statusCode} ${proxyRes.statusMessage}\r\n`;
+        let headerStr = statusLine;
+        for (let i = 0; i < proxyRes.rawHeaders.length; i += 2) {
+          headerStr += `${proxyRes.rawHeaders[i]}: ${proxyRes.rawHeaders[i+1]}\r\n`;
+        }
+        headerStr += '\r\n';
+        clientSocket.write(headerStr);
+        proxyRes.pipe(clientSocket);
+      });
+      
+      proxyReq.on('error', (err) => {
+        log('Direct HTTP fail:', err.message, 'for', urlObj.host);
         clientSocket.write('HTTP/1.1 502 Bad Gateway\r\n\r\n');
         clientSocket.end();
       });
+      
+      // Send body if any (for POST, etc.)
+      const bodyMatch = data.toString('utf8').split('\r\n\r\n');
+      if (bodyMatch.length > 1) {
+        proxyReq.write(bodyMatch[1]);
+      }
+      proxyReq.end();
     }
   });
 });
