@@ -1,4 +1,4 @@
-# Happ Custom VPN
+# Happ Custom VPN *does not work. implementation is not possible*
 
 Unofficial Chrome extension for Happ VPN — works with VLESS+WS proxy configurations.
 
